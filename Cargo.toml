@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ceilidh-protocol",
+    "crates/ceilidh-caller",
+    "crates/ceilidh-runner",
+    "crates/ceilidh-server",
+    "crates/ceilidh-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ceilidh-ai/ceilidh"
+
+[workspace.dependencies]
+ceilidh-protocol = { path = "crates/ceilidh-protocol" }
+ceilidh-caller = { path = "crates/ceilidh-caller" }
+ceilidh-runner = { path = "crates/ceilidh-runner" }
+ceilidh-server = { path = "crates/ceilidh-server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rust-embed = "8"
+
+[profile.release]
+lto = "thin"
+strip = true

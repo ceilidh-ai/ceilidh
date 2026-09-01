@@ -1,0 +1,20 @@
+[package]
+name = "ceilidh-cli"
+description = "The ceilidh binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ceilidh"
+path = "src/main.rs"
+
+[dependencies]
+ceilidh-protocol.workspace = true
+ceilidh-server.workspace = true
+ceilidh-runner.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

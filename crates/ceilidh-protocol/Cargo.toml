@@ -1,0 +1,13 @@
+[package]
+name = "ceilidh-protocol"
+description = "The shared contract between the caller, the band runners, and the web client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true

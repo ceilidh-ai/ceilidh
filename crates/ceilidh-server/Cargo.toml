@@ -1,0 +1,23 @@
+[package]
+name = "ceilidh-server"
+description = "The caller's HTTP surface: axum API, SSE events, embedded web UI, SQLite store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ceilidh-protocol.workspace = true
+ceilidh-caller.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+rust-embed.workspace = true

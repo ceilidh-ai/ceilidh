@@ -1,0 +1,10 @@
+/target
+**/target
+node_modules/
+web/dist/
+.env
+*.db
+*.db-wal
+*.db-shm
+.ceilidh/
+.DS_Store
