@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().cmd {
         Cmd::Serve(a) => {
+            guard_exposed_bind(a.bind, a.token.as_ref())?;
             let web_dir = resolve_web_dir(a.web_dir);
             ceilidh_server::serve_with_web_dir(
                 ceilidh_server::ServeOptions {
@@ -125,6 +126,7 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Up(a) => {
+            guard_exposed_bind(a.serve.bind, a.serve.token.as_ref())?;
             let web_dir = resolve_web_dir(a.serve.web_dir.clone());
             let serve_opts = ceilidh_server::ServeOptions {
                 bind: a.serve.bind,
@@ -165,6 +167,18 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Binding beyond loopback with no token would publish session creation, the
+/// runner protocol, and every transcript to the whole network.
+fn guard_exposed_bind(bind: SocketAddr, token: Option<&String>) -> Result<()> {
+    if bind.ip().is_loopback() || token.is_some_and(|t| !t.is_empty()) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing to bind {bind} without a token: set CEILIDH_TOKEN (or --token), or bind to 127.0.0.1"
+    )
 }
 
 /// The explicit flag wins; otherwise web/dist is picked up when it exists.

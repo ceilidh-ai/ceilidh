@@ -12,10 +12,17 @@ pub fn transition_allowed(from: TurnStatus, to: TurnStatus) -> bool {
         (from, to),
         (Queued, Claimed)
             | (Claimed, Working)
+            // A turn that streamed nothing never reaches Working, and still
+            // has to be able to finish.
+            | (Claimed, Done)
+            | (Claimed, Capped)
             | (Claimed, Error)
             | (Working, Done)
             | (Working, Error)
             | (Working, Capped)
+            // A runner that dies mid-flight has its turn requeued.
+            | (Claimed, Queued)
+            | (Working, Queued)
             | (Capped, Queued)
     )
 }
@@ -30,6 +37,19 @@ mod tests {
         assert!(transition_allowed(Queued, Claimed));
         assert!(transition_allowed(Claimed, Working));
         assert!(transition_allowed(Working, Done));
+    }
+
+    #[test]
+    fn a_silent_turn_can_still_finish() {
+        // No chunks means the turn never left Claimed.
+        assert!(transition_allowed(Claimed, Done));
+        assert!(transition_allowed(Claimed, Capped));
+    }
+
+    #[test]
+    fn abandoned_work_can_be_requeued() {
+        assert!(transition_allowed(Claimed, Queued));
+        assert!(transition_allowed(Working, Queued));
     }
 
     #[test]

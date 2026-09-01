@@ -370,3 +370,199 @@ where
         buf.push_str(std::str::from_utf8(&chunk)?);
     }
 }
+
+/// A second turn must carry the harness session token the first turn produced,
+/// or every turn starts a cold conversation and continuity is fiction.
+#[tokio::test]
+async fn claim_carries_forward_the_previous_resume_token() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-resume-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: None,
+    })
+    .await?;
+
+    let session: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "resume".to_string(),
+            lane: Some(Lane {
+                harness: Harness::Mock,
+                model: "mock".to_string(),
+                effort: None,
+            }),
+            profile: None,
+        },
+    )
+    .await?;
+
+    let turns_uri = format!("/api/sessions/{}/turns", session.id);
+    let claim = ClaimRequest {
+        runner: "runner-a".to_string(),
+        harnesses: vec![Harness::Mock],
+        wait_seconds: 0,
+    };
+
+    let first: Turn = send_json(
+        &app,
+        Method::POST,
+        &turns_uri,
+        None,
+        &PostTurnRequest {
+            input: "one".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    let claimed: ClaimResponse =
+        send_json(&app, Method::POST, "/api/runner/claim", None, &claim).await?;
+    assert!(matches!(claimed, ClaimResponse::Work { .. }));
+
+    let _: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/runner/turns/{}/report", first.id),
+        None,
+        &ReportRequest {
+            status: TurnStatus::Done,
+            envelope: Some(Envelope {
+                headline: "done".to_string(),
+                work_complete: true,
+                cannot_proceed: false,
+                body_markdown: "done".to_string(),
+                questions: Vec::new(),
+            }),
+            error: None,
+            commit: Some("abc123".to_string()),
+            resume_token: Some("harness-session-1".to_string()),
+        },
+    )
+    .await?;
+
+    let _: Turn = send_json(
+        &app,
+        Method::POST,
+        &turns_uri,
+        None,
+        &PostTurnRequest {
+            input: "two".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    let second: ClaimResponse =
+        send_json(&app, Method::POST, "/api/runner/claim", None, &claim).await?;
+
+    match second {
+        ClaimResponse::Work { work } => {
+            assert_eq!(
+                work.turn.resume_token.as_deref(),
+                Some("harness-session-1"),
+                "second turn should resume the first turn's harness session"
+            );
+        }
+        ClaimResponse::Empty => bail!("expected the second turn to be claimable"),
+    }
+
+    Ok(())
+}
+
+/// A runner that dies mid-turn must not wedge the session behind the
+/// one-in-flight rule: the abandoned turn goes back on the queue.
+#[tokio::test]
+async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-stale-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: None,
+    })
+    .await?;
+
+    let session: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "stale".to_string(),
+            lane: Some(Lane {
+                harness: Harness::Mock,
+                model: "mock".to_string(),
+                effort: None,
+            }),
+            profile: None,
+        },
+    )
+    .await?;
+
+    let turn: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &PostTurnRequest {
+            input: "hello".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    let first: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "doomed-runner".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+        },
+    )
+    .await?;
+    assert!(matches!(first, ClaimResponse::Work { .. }));
+
+    // The doomed runner never heartbeats again; age its last_seen past the
+    // online window so the next claim treats its work as abandoned.
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.join("ceilidh.db").display()
+    ))
+    .await?;
+    sqlx::query("UPDATE runners SET last_seen = ? WHERE runner = ?")
+        .bind("2000-01-01T00:00:00Z")
+        .bind("doomed-runner")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+
+    let rescued: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "rescue-runner".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+        },
+    )
+    .await?;
+
+    match rescued {
+        ClaimResponse::Work { work } => assert_eq!(work.turn.id, turn.id),
+        ClaimResponse::Empty => bail!("abandoned turn should have been requeued"),
+    }
+
+    Ok(())
+}

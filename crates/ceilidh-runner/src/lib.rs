@@ -176,12 +176,20 @@ async fn execute_work(
 
     if commit.is_some() && work.session.profile.allow_push {
         if let Err(err) = workspace.push().await {
+            let message = format!("git push failed: {err:#}");
             warn!(
                 turn_id = %work.turn.id,
                 session_id = %work.session.id,
-                error = %err,
-                "git push failed"
+                error = %message,
             );
+            // A push the operator asked for and did not get must be visible in
+            // the turn, not only in a log nobody reads.
+            append_error(&mut outcome.error, message.clone());
+            if let Some(envelope) = outcome.envelope.as_mut() {
+                envelope
+                    .body_markdown
+                    .push_str(&format!("\n\n> warning: {message}\n"));
+            }
         }
     }
 
@@ -240,28 +248,11 @@ impl RunnerApi {
 
     async fn post_chunk(&self, turn_id: TurnId, text: &str) -> Result<()> {
         let request = ChunkRequest { text };
-        let events_path = format!("/api/runner/turns/{turn_id}/events");
+        let chunk_path = format!("/api/runner/turns/{turn_id}/chunk");
         let response = self
-            .send_json(Method::POST, &events_path, &request)
+            .send_json(Method::POST, &chunk_path, &request)
             .await
             .with_context(|| format!("post chunk for turn {turn_id}"))?;
-
-        if response.status().is_success() {
-            return Ok(());
-        }
-
-        if matches!(
-            response.status(),
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-        ) {
-            let chunk_path = format!("/api/runner/turns/{turn_id}/chunk");
-            let fallback = self
-                .send_json(Method::POST, &chunk_path, &request)
-                .await
-                .with_context(|| format!("post fallback chunk for turn {turn_id}"))?;
-            expect_success(fallback, "chunk").await?;
-            return Ok(());
-        }
 
         expect_success(response, "chunk").await?;
         Ok(())
@@ -787,14 +778,28 @@ impl WorkspaceManager {
             .with_context(|| format!("create session dir {}", session_dir.display()))?;
 
         if let Some(repo_url) = &session.profile.repo_url {
+            validate_repo_url(repo_url)?;
             let mut args = vec!["clone".to_string()];
             if let Some(base_branch) = &session.profile.base_branch {
+                validate_ref_name(base_branch)?;
                 args.push("-b".to_string());
                 args.push(base_branch.clone());
             }
+            // `--` keeps an option-looking URL from being parsed as a git flag.
+            args.push("--".to_string());
             args.push(repo_url.clone());
             args.push("ws".to_string());
             run_git(&session_dir, args).await.context("git clone")?;
+
+            // A session that already ran elsewhere has its branch on the
+            // remote; failing over must continue that history, never start a
+            // fresh branch from base and silently orphan prior turns.
+            if resume_remote_branch(&workspace_dir, &branch).await? {
+                return Ok(Workspace {
+                    dir: workspace_dir,
+                    branch,
+                });
+            }
         } else {
             fs::create_dir_all(&workspace_dir)
                 .await
@@ -902,9 +907,87 @@ async fn git_commit_allow_empty(workspace_dir: &Path, message: &str) -> Result<C
     }
 }
 
+/// A session profile arrives over the API, so its repo URL is untrusted input
+/// that lands in a git argv. Only plain remote URLs are accepted.
+fn validate_repo_url(repo_url: &str) -> Result<()> {
+    if repo_url.starts_with("https://") || repo_url.starts_with("http://") {
+        Ok(())
+    } else {
+        bail!("repo_url must be an http:// or https:// URL, got {repo_url:?}")
+    }
+}
+
+fn validate_ref_name(name: &str) -> Result<()> {
+    let shaped = !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
+
+    if shaped {
+        Ok(())
+    } else {
+        bail!("invalid git ref name {name:?}")
+    }
+}
+
+/// Checks out the session branch from the remote when a prior runner already
+/// pushed it. Returns false when there is nothing to resume.
+async fn resume_remote_branch(workspace_dir: &Path, branch: &str) -> Result<bool> {
+    let listed = run_git(
+        workspace_dir,
+        vec![
+            "ls-remote".to_string(),
+            "--heads".to_string(),
+            "origin".to_string(),
+            branch.to_string(),
+        ],
+    )
+    .await;
+
+    let exists = match listed {
+        Ok(output) => !output.stdout.trim().is_empty(),
+        Err(err) => {
+            warn!(branch = %branch, error = %err, "could not list remote session branch");
+            return Ok(false);
+        }
+    };
+
+    if !exists {
+        return Ok(false);
+    }
+
+    run_git(
+        workspace_dir,
+        vec![
+            "fetch".to_string(),
+            "origin".to_string(),
+            format!("{branch}:{branch}"),
+        ],
+    )
+    .await
+    .with_context(|| format!("fetch existing session branch {branch}"))?;
+
+    run_git(
+        workspace_dir,
+        vec!["checkout".to_string(), branch.to_string()],
+    )
+    .await
+    .with_context(|| format!("checkout existing session branch {branch}"))?;
+
+    info!(branch = %branch, "resumed existing session branch from origin");
+    Ok(true)
+}
+
 async fn run_git(workspace_dir: &Path, args: Vec<String>) -> Result<CommandOutput> {
     debug!(cwd = %workspace_dir.display(), args = ?args, "running git command");
     let output = Command::new("git")
+        // A session repo is untrusted content: never let its hooks execute as
+        // the runner's OS user, which holds the harness and git credentials.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
         .args(&args)
         .current_dir(workspace_dir)
         .stdin(Stdio::null())

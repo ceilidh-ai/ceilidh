@@ -1,9 +1,13 @@
 //! ceilidh-protocol: the shared contract between the caller (server), the band
 //! runners, and the web client. Serde types only, no IO.
 //!
-//! Contract discipline during phase 1: changes are ADDITIVE ONLY. Add new
-//! fields with `#[serde(default)]` and new enum variants at the end; never
-//! rename or remove. The supervisor reconciles contract edits at merge.
+//! Contract discipline during phase 1: struct fields are ADDITIVE ONLY (add
+//! them with `#[serde(default)]`; never rename or remove).
+//!
+//! Enum variants are NOT additive in the same sense: serde rejects an unknown
+//! variant, so a new `TurnStatus` or `Event` breaks older binaries that
+//! deserialize it. Adding a variant therefore means upgrading caller and
+//! runners together, until this grows a tolerant representation.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -593,6 +593,7 @@ async fn try_claim(
 ) -> Result<Option<ClaimedWork>, ApiError> {
     let mut tx = state.pool.begin().await?;
     upsert_runner_seen(&mut tx, request).await?;
+    let reclaimed = reclaim_stale_turns(&mut tx).await?;
 
     let queued = sqlx::query(
         r#"
@@ -690,19 +691,118 @@ async fn try_claim(
 
     tx.commit().await?;
 
+    for turn_id in reclaimed {
+        state.notify.notify_waiters();
+        tracing::warn!(turn_id = %turn_id, "requeued a turn whose runner went offline mid-flight");
+    }
+
     let Some(turn_id) = claimed_turn_id else {
         return Ok(None);
     };
 
-    let turn = get_turn_by_id(&state.pool, turn_id).await?;
+    let mut turn = get_turn_by_id(&state.pool, turn_id).await?;
     let session = get_session_by_id(&state.pool, turn.session_id).await?;
     let history_hint = history_hint(&state.pool, turn.session_id, turn.seq).await?;
+
+    // A fresh turn row carries no resume token of its own: continuity comes
+    // from the session's last harness session token, so the adapter can
+    // --resume instead of reseeding from history.
+    if turn.resume_token.is_none() {
+        turn.resume_token = latest_resume_token(&state.pool, turn.session_id, turn.seq).await?;
+    }
 
     Ok(Some(ClaimedWork {
         turn,
         session,
         history_hint,
     }))
+}
+
+/// A turn held by a runner that has stopped heartbeating is dead work: without
+/// this the session wedges forever behind the one-in-flight rule.
+async fn reclaim_stale_turns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<TurnId>, ApiError> {
+    let cutoff = Utc::now() - TimeDelta::seconds(ONLINE_WINDOW_SECS);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT t.id AS id
+        FROM turns t
+        JOIN sessions s ON s.id = t.session_id
+        WHERE t.status IN (?, ?)
+          AND (
+            s.runner_affinity IS NULL
+            OR NOT EXISTS (
+              SELECT 1 FROM runners r
+              WHERE r.runner = s.runner_affinity
+                AND r.last_seen >= ?
+            )
+          )
+        "#,
+    )
+    .bind(enum_string(&TurnStatus::Claimed)?)
+    .bind(enum_string(&TurnStatus::Working)?)
+    .bind(dt_string(cutoff))
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut reclaimed = Vec::new();
+    for row in rows {
+        let raw: String = row.try_get("id")?;
+        let Ok(turn_id) = Uuid::parse_str(&raw) else {
+            continue;
+        };
+
+        let result = sqlx::query(
+            r#"
+            UPDATE turns
+            SET status = ?, started_at = NULL
+            WHERE id = ?
+              AND status IN (?, ?)
+            "#,
+        )
+        .bind(enum_string(&TurnStatus::Queued)?)
+        .bind(&raw)
+        .bind(enum_string(&TurnStatus::Claimed)?)
+        .bind(enum_string(&TurnStatus::Working)?)
+        .execute(&mut **tx)
+        .await?;
+
+        if result.rows_affected() == 1 {
+            reclaimed.push(turn_id);
+        }
+    }
+
+    Ok(reclaimed)
+}
+
+/// The newest harness resume token this session produced before `before_seq`.
+async fn latest_resume_token(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    before_seq: i64,
+) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT resume_token
+        FROM turns
+        WHERE session_id = ?
+          AND seq < ?
+          AND resume_token IS NOT NULL
+        ORDER BY seq DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(session_id.to_string())
+    .bind(before_seq)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(match row {
+        Some(row) => row.try_get::<Option<String>, _>("resume_token")?,
+        None => None,
+    })
 }
 
 async fn upsert_runner_seen(
