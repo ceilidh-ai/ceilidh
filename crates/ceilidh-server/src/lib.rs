@@ -52,8 +52,15 @@ pub struct ServeOptions {
 }
 
 pub async fn serve(opts: ServeOptions) -> anyhow::Result<()> {
+    serve_with_web_dir(opts, None).await
+}
+
+pub async fn serve_with_web_dir(
+    opts: ServeOptions,
+    web_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let bind = opts.bind;
-    let app = build_app(opts).await?;
+    let app = build_app_with_web_dir(opts, web_dir).await?;
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "ceilidh caller listening");
     axum::serve(listener, app).await?;

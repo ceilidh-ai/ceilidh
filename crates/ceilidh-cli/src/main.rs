@@ -36,6 +36,9 @@ struct ServeArgs {
     /// Bearer token required on every request (env: CEILIDH_TOKEN)
     #[arg(long, env = "CEILIDH_TOKEN")]
     token: Option<String>,
+    /// Directory of built web assets; defaults to web/dist when present
+    #[arg(long)]
+    web_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -61,6 +64,12 @@ struct RunnerArgs {
 struct UpArgs {
     #[command(flatten)]
     serve: ServeArgs,
+    /// Where the local runner keeps session workspaces
+    #[arg(long, default_value = ".ceilidh/runner")]
+    data_dir: PathBuf,
+    /// Harnesses the local runner offers (repeatable)
+    #[arg(long = "harness", value_enum, default_values_t = vec![HarnessArg::ClaudeCode])]
+    harnesses: Vec<HarnessArg>,
     /// Offer the mock harness too (used by scripts/smoke.sh)
     #[arg(long)]
     mock: bool,
@@ -94,11 +103,15 @@ async fn main() -> Result<()> {
 
     match Cli::parse().cmd {
         Cmd::Serve(a) => {
-            ceilidh_server::serve(ceilidh_server::ServeOptions {
-                bind: a.bind,
-                db_path: a.db,
-                token: a.token,
-            })
+            let web_dir = resolve_web_dir(a.web_dir);
+            ceilidh_server::serve_with_web_dir(
+                ceilidh_server::ServeOptions {
+                    bind: a.bind,
+                    db_path: a.db,
+                    token: a.token,
+                },
+                web_dir,
+            )
             .await
         }
         Cmd::Runner(a) => {
@@ -112,10 +125,52 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::Up(a) => {
-            // Integration lands in wave 2: serve + a local runner in one
-            // process, with the runner joining once the server is listening.
-            let _ = a;
-            anyhow::bail!("ceilidh up is not wired yet (wave 2 integration)")
+            let web_dir = resolve_web_dir(a.serve.web_dir.clone());
+            let serve_opts = ceilidh_server::ServeOptions {
+                bind: a.serve.bind,
+                db_path: a.serve.db,
+                token: a.serve.token.clone(),
+            };
+
+            let mut harnesses: Vec<ceilidh_protocol::Harness> =
+                a.harnesses.into_iter().map(Into::into).collect();
+            if a.mock && !harnesses.contains(&ceilidh_protocol::Harness::Mock) {
+                harnesses.push(ceilidh_protocol::Harness::Mock);
+            }
+
+            let host = if a.serve.bind.ip().is_unspecified() {
+                "127.0.0.1".to_string()
+            } else {
+                a.serve.bind.ip().to_string()
+            };
+            let runner_opts = ceilidh_runner::RunnerOptions {
+                server_url: format!("http://{}:{}", host, a.serve.bind.port()),
+                token: a.serve.token,
+                runner_id: None,
+                data_dir: a.data_dir,
+                harnesses,
+            };
+
+            let server = tokio::spawn(ceilidh_server::serve_with_web_dir(serve_opts, web_dir));
+            let runner = tokio::spawn(async move {
+                // The runner's claim loop retries with backoff, so it only
+                // needs a beat for the listener to bind.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                ceilidh_runner::run(runner_opts).await
+            });
+
+            tokio::select! {
+                r = server => r?,
+                r = runner => r?,
+            }
         }
     }
+}
+
+/// The explicit flag wins; otherwise web/dist is picked up when it exists.
+fn resolve_web_dir(flag: Option<PathBuf>) -> Option<PathBuf> {
+    flag.or_else(|| {
+        let default = PathBuf::from("web/dist");
+        default.is_dir().then_some(default)
+    })
 }
