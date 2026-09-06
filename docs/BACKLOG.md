@@ -43,16 +43,25 @@ multi-tenancy, Postgres.
 ## From the 2026-09-06 multi-vendor build
 
 1. **The MCP process holds the operator's token.** The runner hands
-   `CEILIDH_TOKEN` to every `ceilidh mcp` child, which puts it in a config file
-   inside the session workspace tree for cursor and in a harness config for
-   codex. Both are mode 0600 and excluded from the turn commit, but this is the
-   same root problem as item 1 above and the same fix (runner and MCP scoped
-   credentials) closes both.
-2. **A cancelled turn's harness is killed, not asked to stop.** Fine for a
-   read-only turn; a turn mid-write leaves the workspace as it was, and the
-   commit that follows captures it. Worth a graceful signal first.
-3. **Sub-agent depth is unbounded.** A child's harness gets the same MCP, so it
-   can spawn its own children. Nothing limits depth or total fan-out today.
+   `CEILIDH_TOKEN` to every `ceilidh mcp` child through its config block. The
+   harness process itself no longer sees it (the adapter clears it from the
+   environment) and the tools only reach this session's own family, but the
+   token is still the operator's. Same root problem as item 1 above, same fix.
+2. **A cancelled turn's harness is killed, not asked to stop.** It is killed by
+   process group now, so nothing is orphaned, but a graceful signal first would
+   let a turn mid-write finish its file.
+3. **Sub-agent depth is unbounded.** A child's harness gets its own MCP, so it
+   can spawn its own children. Concurrent spawns per process are capped at
+   four; total depth and fleet-wide fan-out are not.
+4. **A child session's repository is model-chosen.** `spawn_subagent` accepts a
+   `repo` argument, so a prompt-injected parent can make a runner clone an
+   arbitrary public URL. Children never push and never inherit the parent's
+   push permission, which removes the exfiltration path, but a runner-side
+   allowlist is still the real fix.
+5. **A harness that writes nothing to stdout fails the turn.** Reporting an
+   empty reply as success hid a whole class of harness misconfiguration, so an
+   empty reply is now an error. A harness that legitimately answers with
+   silence would need a different signal.
 
 ## Operational
 
