@@ -107,6 +107,7 @@ async fn runner_flow_emits_sse_and_persists_final_state() -> Result<()> {
             runner: "runner-1".to_string(),
             harnesses: vec![Harness::Mock],
             wait_seconds: 1,
+            epoch: None,
         },
     )
     .await?;
@@ -431,6 +432,7 @@ async fn claim_carries_forward_the_previous_resume_token() -> Result<()> {
         runner: "runner-a".to_string(),
         harnesses: vec![Harness::Mock],
         wait_seconds: 0,
+        epoch: None,
     };
 
     let first: Turn = send_json(
@@ -553,6 +555,7 @@ async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
             runner: "doomed-runner".to_string(),
             harnesses: vec![Harness::Mock],
             wait_seconds: 0,
+            epoch: None,
         },
     )
     .await?;
@@ -581,6 +584,7 @@ async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
             runner: "rescue-runner".to_string(),
             harnesses: vec![Harness::Mock],
             wait_seconds: 0,
+            epoch: None,
         },
     )
     .await?;
@@ -650,6 +654,7 @@ async fn heartbeat_releases_turns_the_runner_no_longer_holds() -> Result<()> {
             runner: "restarting-runner".to_string(),
             harnesses: vec![Harness::Mock],
             wait_seconds: 0,
+            epoch: None,
         },
     )
     .await?;
@@ -665,6 +670,7 @@ async fn heartbeat_releases_turns_the_runner_no_longer_holds() -> Result<()> {
             runner: "restarting-runner".to_string(),
             active_turns: vec![],
             at: chrono::Utc::now(),
+            epoch: None,
         },
     )
     .await?;
@@ -702,6 +708,7 @@ async fn heartbeat_releases_turns_the_runner_no_longer_holds() -> Result<()> {
             runner: "restarting-runner".to_string(),
             active_turns: vec![],
             at: chrono::Utc::now(),
+            epoch: None,
         },
     )
     .await?;
@@ -726,10 +733,268 @@ async fn heartbeat_releases_turns_the_runner_no_longer_holds() -> Result<()> {
             runner: "restarting-runner".to_string(),
             harnesses: vec![Harness::Mock],
             wait_seconds: 0,
+            epoch: None,
         },
     )
     .await?;
     assert!(matches!(again, ClaimResponse::Work { .. }), "the released turn is claimable again");
 
+    Ok(())
+}
+
+
+/// Two processes under one runner id (an orphan left behind by a redeploy)
+/// must not release each other's turns, and a genuinely restarted runner
+/// should get its old process's turns back immediately rather than waiting
+/// out an online window that its own heartbeats keep refreshing.
+#[tokio::test]
+async fn runner_epochs_separate_a_restart_from_an_orphan() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-epoch-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: None,
+        default_repo_url: None,
+    })
+    .await?;
+
+    let session: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "epochs".to_string(),
+            lane: Some(Lane {
+                harness: Harness::Mock,
+                model: "mock".to_string(),
+                effort: None,
+            }),
+            profile: None,
+            parent_id: None,
+        },
+    )
+    .await?;
+
+    let turn: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &PostTurnRequest {
+            input: "hello".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    let claimed: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "shared-id".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+            epoch: Some("epoch-one".to_string()),
+        },
+    )
+    .await?;
+    assert!(matches!(claimed, ClaimResponse::Work { .. }));
+
+    // Age the claim past the grace window so only the epoch decides.
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.join("ceilidh.db").display()
+    ))
+    .await?;
+    sqlx::query("UPDATE turns SET started_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00Z")
+        .bind(turn.id.to_string())
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+
+    // The orphan process shares the id but not the epoch: its empty heartbeat
+    // must not touch the live process's turn.
+    let status = send_status(
+        &app,
+        Method::POST,
+        "/api/runner/heartbeat",
+        None,
+        &ceilidh_protocol::Heartbeat {
+            runner: "shared-id".to_string(),
+            active_turns: vec![],
+            at: chrono::Utc::now(),
+            epoch: Some("orphan-epoch".to_string()),
+        },
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let turns: Vec<Turn> = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(
+        turns[0].status,
+        TurnStatus::Claimed,
+        "an orphan's heartbeat must not release the live process's turn"
+    );
+
+    // The live process's own heartbeat, still holding it, changes nothing.
+    send_status(
+        &app,
+        Method::POST,
+        "/api/runner/heartbeat",
+        None,
+        &ceilidh_protocol::Heartbeat {
+            runner: "shared-id".to_string(),
+            active_turns: vec![turn.id],
+            at: chrono::Utc::now(),
+            epoch: Some("epoch-one".to_string()),
+        },
+    )
+    .await?;
+    let turns: Vec<Turn> = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(turns[0].status, TurnStatus::Claimed);
+
+    // A restart: same id, new epoch. Its first claim releases the dead
+    // process's turn and hands it straight back.
+    let after_restart: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "shared-id".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+            epoch: Some("epoch-two".to_string()),
+        },
+    )
+    .await?;
+    match after_restart {
+        ClaimResponse::Work { work } => assert_eq!(work.turn.id, turn.id),
+        ClaimResponse::Empty => bail!("a restarted runner should reclaim its own abandoned turn"),
+    }
+
+    Ok(())
+}
+
+/// The session workspace is one directory, so the caller must never hand out
+/// a second turn for a session that already has one in flight, even when a
+/// reclaim put an older turn back on the queue.
+#[tokio::test]
+async fn a_session_never_has_two_turns_claimed_at_once() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-one-turn-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: None,
+        default_repo_url: None,
+    })
+    .await?;
+
+    let session: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "one at a time".to_string(),
+            lane: Some(Lane {
+                harness: Harness::Mock,
+                model: "mock".to_string(),
+                effort: None,
+            }),
+            profile: None,
+            parent_id: None,
+        },
+    )
+    .await?;
+
+    let first: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &PostTurnRequest {
+            input: "one".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    let claimed: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "runner-a".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+            epoch: Some("a".to_string()),
+        },
+    )
+    .await?;
+    assert!(matches!(claimed, ClaimResponse::Work { .. }));
+
+    // Force a second queued turn for the same session, the state a reclaim
+    // race can produce, and prove no runner is offered it while the first is
+    // still in flight.
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.join("ceilidh.db").display()
+    ))
+    .await?;
+    sqlx::query(
+        "INSERT INTO turns (id, session_id, seq, input, status, created_at)
+         VALUES (?, ?, ?, ?, 'queued', ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(session.id.to_string())
+    .bind(2_i64)
+    .bind("two")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+
+    let second: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "runner-b".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+            epoch: Some("b".to_string()),
+        },
+    )
+    .await?;
+    assert!(
+        matches!(second, ClaimResponse::Empty),
+        "no runner may take a second turn for a session that is already busy"
+    );
+
+    let _ = first;
     Ok(())
 }

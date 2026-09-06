@@ -2,7 +2,7 @@ export type SessionId = string
 export type TurnId = string
 export type RunnerId = string
 
-export type Harness = 'claude-code' | 'codex' | 'mock'
+export type Harness = 'claude-code' | 'codex' | 'cursor' | 'mock'
 
 export type Lane = {
   harness: Harness
@@ -25,6 +25,8 @@ export type Session = {
   profile: SessionProfile
   runner_affinity?: RunnerId | null
   status: SessionStatus
+  /** Set when this session was spawned as a sub-agent of another session. */
+  parent_id?: SessionId | null
   created_at: string
   updated_at: string
 }
@@ -36,6 +38,7 @@ export type TurnStatus =
   | 'done'
   | 'error'
   | 'capped'
+  | 'cancelled'
 
 export type Question = {
   text: string
@@ -61,6 +64,8 @@ export type Turn = {
   error?: string | null
   commit?: string | null
   resume_token?: string | null
+  /** True once a cancel was asked for and the runner has not reported yet. */
+  cancel_requested: boolean
   created_at: string
   started_at?: string | null
   finished_at?: string | null
@@ -73,10 +78,24 @@ export type RunnerStatusInfo = {
   active_turns: number
 }
 
+/** One row of the model menu the caller offers, grouped by vendor. */
+export type ModelChoice = {
+  vendor: string
+  harness: Harness
+  model: string
+  label: string
+}
+
+export type CallerConfig = {
+  default_repo_url?: string | null
+  models: ModelChoice[]
+}
+
 export type CreateSessionRequest = {
   title: string
   lane?: Lane
   profile?: SessionProfile
+  parent_id?: SessionId
 }
 
 export type PostTurnRequest = {
@@ -90,4 +109,6 @@ export type Event =
   | { type: 'chunk'; turn_id: TurnId; text: string }
   | { type: 'turn_done'; turn: Turn }
   | { type: 'turn_error'; turn_id: TurnId; message: string }
+  | { type: 'turn_cancelled'; turn: Turn }
+  | { type: 'session_created'; session: Session }
   | { type: 'runner_status'; runner: RunnerStatusInfo }

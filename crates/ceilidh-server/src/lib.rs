@@ -6,9 +6,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
@@ -27,6 +25,7 @@ use ceilidh_protocol::{
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use futures_core::Stream;
+use futures_util::stream;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,7 +38,10 @@ use uuid::Uuid;
 
 const ONLINE_WINDOW_SECS: i64 = 60;
 /// A turn claimed this recently may not yet be in its runner's heartbeat set.
-const HELD_TURN_GRACE_SECS: i64 = 15;
+/// It exceeds the runner's own HTTP timeout on purpose: a heartbeat body is
+/// built before it is sent, so a slow request can carry a snapshot that is
+/// already stale by that whole timeout.
+const HELD_TURN_GRACE_SECS: i64 = 90;
 const CLAIM_WAIT_CAP_SECS: u32 = 30;
 const SSE_KEEP_ALIVE_SECS: u64 = 15;
 const HISTORY_HINT_LIMIT: i64 = 8;
@@ -553,46 +555,34 @@ fn sse_stream(
     receiver: broadcast::Receiver<BroadcastEvent>,
     session_id: Option<SessionId>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    Sse::new(EventStream {
-        receiver,
-        session_id,
-    })
-    .keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(SSE_KEEP_ALIVE_SECS))
-            .text("keep-alive"),
-    )
-}
-
-struct EventStream {
-    receiver: broadcast::Receiver<BroadcastEvent>,
-    session_id: Option<SessionId>,
-}
-
-impl Stream for EventStream {
-    type Item = Result<SseEvent, Infallible>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    // A hand-rolled Stream that builds a fresh `recv()` future on every poll
+    // drops it when it returns Pending, and `Recv::drop` deregisters the
+    // waker, so a later `send` wakes nobody and events only surface on the
+    // next keep-alive tick. Holding one future across polls is the whole fix.
+    let stream = stream::unfold((receiver, session_id), |(mut receiver, session_id)| async move {
         loop {
-            let session_id = self.session_id;
-            let recv = self.receiver.recv();
-            tokio::pin!(recv);
-
-            match recv.poll(cx) {
-                Poll::Ready(Ok(message)) => {
+            match receiver.recv().await {
+                Ok(message) => {
                     if session_id.is_none() || message.session_id == session_id {
                         let event = SseEvent::default()
                             .json_data(&message.event)
                             .expect("protocol events serialize");
-                        return Poll::Ready(Some(Ok(event)));
+                        return Some((Ok(event), (receiver, session_id)));
                     }
                 }
-                Poll::Ready(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Poll::Ready(Err(broadcast::error::RecvError::Closed)) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "an SSE subscriber lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
-    }
+    });
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(SSE_KEEP_ALIVE_SECS))
+            .text("keep-alive"),
+    )
 }
 
 async fn list_runners(
@@ -664,6 +654,23 @@ async fn try_claim(
     state: &AppState,
     request: &ClaimRequest,
 ) -> Result<Option<ClaimedWork>, ApiError> {
+    // A runner that restarted arrives with a fresh epoch: whatever its
+    // previous process was holding is dead work, released now rather than
+    // after the online window (which never expires, because the new process
+    // keeps the shared runner id alive).
+    let restarted = match (&request.epoch, runner_epoch(&state.pool, &request.runner).await?) {
+        (Some(epoch), Some(previous)) => epoch != &previous,
+        _ => false,
+    };
+    if restarted {
+        let released = release_turns_not_held(&state.pool, &request.runner, &[], Utc::now(), 0)
+            .await?;
+        for (turn_id, session_id, status) in released {
+            tracing::warn!(turn_id = %turn_id, runner = %request.runner, ?status, "released a turn held by a previous runner process");
+            emit_release(state, turn_id, session_id, status).await;
+        }
+    }
+
     let mut tx = state.pool.begin().await?;
     upsert_runner_seen(&mut tx, request).await?;
     let reclaimed = reclaim_stale_turns(&mut tx).await?;
@@ -698,11 +705,22 @@ async fn try_claim(
         JOIN sessions s ON s.id = t.session_id
         WHERE t.status = ?
           AND s.status = ?
+          -- One turn per session at a time: the session's git workspace is a
+          -- single directory, so two concurrent turns would corrupt it. The
+          -- API already refuses a second in-flight turn; this holds the line
+          -- when a reclaim races the runner that is still playing the turn.
+          AND NOT EXISTS (
+            SELECT 1 FROM turns busy
+            WHERE busy.session_id = t.session_id
+              AND busy.status IN (?, ?)
+          )
         ORDER BY t.created_at ASC, t.seq ASC
         "#,
     )
     .bind(enum_string(&TurnStatus::Queued)?)
     .bind(enum_string(&SessionStatus::Active)?)
+    .bind(enum_string(&TurnStatus::Claimed)?)
+    .bind(enum_string(&TurnStatus::Working)?)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -897,21 +915,34 @@ async fn upsert_runner_seen(
 ) -> Result<(), ApiError> {
     sqlx::query(
         r#"
-        INSERT INTO runners (runner, last_seen, harnesses, active_turns)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO runners (runner, last_seen, harnesses, active_turns, epoch)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(runner) DO UPDATE SET
             last_seen = excluded.last_seen,
-            harnesses = excluded.harnesses
+            harnesses = excluded.harnesses,
+            epoch = COALESCE(excluded.epoch, runners.epoch)
         "#,
     )
     .bind(&request.runner)
     .bind(dt_string(Utc::now()))
     .bind(json_string(&request.harnesses)?)
     .bind(json_string(&Vec::<TurnId>::new())?)
+    .bind(&request.epoch)
     .execute(&mut **tx)
     .await?;
 
     Ok(())
+}
+
+async fn runner_epoch(pool: &SqlitePool, runner: &str) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query("SELECT epoch FROM runners WHERE runner = ?")
+        .bind(runner)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some(row) => row.try_get("epoch")?,
+        None => None,
+    })
 }
 
 async fn runner_is_offline(
@@ -1159,16 +1190,32 @@ async fn heartbeat(
     .execute(&state.pool)
     .await?;
 
-    let released = release_turns_not_held(&state.pool, &payload.runner, &payload.active_turns, now).await?;
-    for (turn_id, session_id, status) in released {
-        tracing::warn!(turn_id = %turn_id, runner = %payload.runner, ?status, "released a turn its runner no longer holds");
-        if status == TurnStatus::Cancelled {
-            if let Ok(turn) = get_turn_by_id(&state.pool, turn_id).await {
-                state.emit(Some(session_id), Event::TurnCancelled { turn });
-            }
+    // Only the process the caller believes owns this runner id may reconcile.
+    // Two processes sharing an id (an orphan left by a redeploy) would
+    // otherwise release each other's turns on every beat.
+    let current_epoch = runner_epoch(&state.pool, &payload.runner).await?;
+    let authoritative = match (&payload.epoch, &current_epoch) {
+        (Some(epoch), Some(current)) => epoch == current,
+        (None, None) => true,
+        // A heartbeat with no epoch from a runner that has claimed with one is
+        // an older binary or a zombie: record it, reconcile nothing.
+        _ => false,
+    };
+    if authoritative {
+        let released = release_turns_not_held(
+            &state.pool,
+            &payload.runner,
+            &payload.active_turns,
+            now,
+            HELD_TURN_GRACE_SECS,
+        )
+        .await?;
+        for (turn_id, session_id, status) in released {
+            tracing::warn!(turn_id = %turn_id, runner = %payload.runner, ?status, "released a turn its runner no longer holds");
+            emit_release(&state, turn_id, session_id, status).await;
         }
+        state.notify.notify_waiters();
     }
-    state.notify.notify_waiters();
 
     state.emit(
         None,
@@ -1191,13 +1238,27 @@ async fn heartbeat(
 /// runner was assigned but does not list goes back on the queue (or finishes
 /// as cancelled if the human already asked), after a short grace for turns
 /// claimed a moment ago.
+async fn emit_release(
+    state: &AppState,
+    turn_id: TurnId,
+    session_id: SessionId,
+    status: TurnStatus,
+) {
+    if status == TurnStatus::Cancelled {
+        if let Ok(turn) = get_turn_by_id(&state.pool, turn_id).await {
+            state.emit(Some(session_id), Event::TurnCancelled { turn });
+        }
+    }
+}
+
 async fn release_turns_not_held(
     pool: &SqlitePool,
     runner: &str,
     held: &[TurnId],
     now: DateTime<Utc>,
+    grace_seconds: i64,
 ) -> Result<Vec<(TurnId, SessionId, TurnStatus)>, ApiError> {
-    let cutoff = now - TimeDelta::seconds(HELD_TURN_GRACE_SECS);
+    let cutoff = now - TimeDelta::seconds(grace_seconds);
     let rows = sqlx::query(
         r#"
         SELECT t.id AS id, t.session_id AS session_id, t.cancel_requested_at AS cancel_requested_at

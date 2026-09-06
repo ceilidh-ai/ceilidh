@@ -218,6 +218,11 @@ pub struct ClaimRequest {
     pub runner: RunnerId,
     /// What this runner can execute.
     pub harnesses: Vec<Harness>,
+    /// Random per-process id. Two processes sharing a runner id (a redeploy
+    /// that left an orphan behind) are told apart by this, and a restarted
+    /// runner's first claim releases the turns its previous process held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
     /// How long the server may hold the poll open before answering empty.
     /// The server caps this (30s in v0).
     #[serde(default)]
@@ -277,6 +282,10 @@ pub struct Heartbeat {
     #[serde(default)]
     pub active_turns: Vec<TurnId>,
     pub at: DateTime<Utc>,
+    /// See `ClaimRequest::epoch`. A heartbeat from a stale epoch is recorded
+    /// but never used to release another process's turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

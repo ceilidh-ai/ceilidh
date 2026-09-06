@@ -93,5 +93,13 @@ PLIST
 chown root:wheel "$plist"; chmod 0644 "$plist"
 
 launchctl bootout system "$plist" >/dev/null 2>&1 || true
+# bootout kills the local ssh client, not the remote command it opened, so the
+# previous runner process survives a reinstall and keeps claiming turns under
+# the same runner id. Reap it before the new one starts.
+for _ in 1 2 3 4 5; do
+  pkill -u "$user" -f "$root/bin/ceilidh runner" >/dev/null 2>&1 || break
+  sleep 1
+done
+pkill -9 -u "$user" -f "$root/bin/ceilidh runner" >/dev/null 2>&1 || true
 launchctl bootstrap system "$plist"
 echo "installed $label (log: /tmp/ceilidh_runner_$user.log)"
