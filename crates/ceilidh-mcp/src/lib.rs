@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use ceilidh_protocol::{
-    CreateSessionRequest, Harness, Lane, PostTurnRequest, Session, SessionId, SessionProfile,
-    Turn, TurnStatus,
+    CallerConfig, CreateSessionRequest, Harness, Lane, ModelChoice, PostTurnRequest, Session,
+    SessionId, SessionProfile, Turn, TurnStatus,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -36,8 +36,23 @@ pub struct McpOptions {
 
 pub async fn run(opts: McpOptions) -> Result<()> {
     let caller = Arc::new(Caller::new(opts)?);
+    // The model menu comes from the caller so the tool description names the
+    // lanes this operator actually has. A model string is an argument to a CLI
+    // on the operator's own machine, and a harness that has never heard of a
+    // given release would otherwise refuse to pass it through.
+    let models = match caller.get_json::<CallerConfig>("/api/config").await {
+        Ok(config) => config.models,
+        Err(err) => {
+            warn!(error = %err, "could not read the caller's model menu");
+            Vec::new()
+        }
+    };
+    let tools = Arc::new(tool_definitions(&models));
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    // Requests are answered concurrently (parallel spawn_subagent calls are the
+    // point), so in-flight replies must outlive the end of stdin.
+    let mut in_flight = tokio::task::JoinSet::new();
 
     while let Some(line) = lines.next_line().await.context("read stdin")? {
         let line = line.trim().to_string();
@@ -66,8 +81,9 @@ pub async fn run(opts: McpOptions) -> Result<()> {
 
         let caller = caller.clone();
         let stdout = stdout.clone();
-        tokio::spawn(async move {
-            let response = match handle(&caller, &method, params).await {
+        let tools = tools.clone();
+        in_flight.spawn(async move {
+            let response = match handle(&caller, &tools, &method, params).await {
                 Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                 Err(err) => json!({
                     "jsonrpc": "2.0",
@@ -84,6 +100,8 @@ pub async fn run(opts: McpOptions) -> Result<()> {
             let _ = out.flush().await;
         });
     }
+
+    while in_flight.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -108,7 +126,12 @@ impl RpcError {
     }
 }
 
-async fn handle(caller: &Caller, method: &str, params: Value) -> Result<Value, RpcError> {
+async fn handle(
+    caller: &Caller,
+    tools: &Value,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcError> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": params
@@ -119,7 +142,7 @@ async fn handle(caller: &Caller, method: &str, params: Value) -> Result<Value, R
             "serverInfo": { "name": "ceilidh", "version": env!("CARGO_PKG_VERSION") }
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+        "tools/list" => Ok(json!({ "tools": tools })),
         "tools/call" => {
             let name = params
                 .get("name")
@@ -144,34 +167,41 @@ async fn handle(caller: &Caller, method: &str, params: Value) -> Result<Value, R
     }
 }
 
-fn tool_definitions() -> Value {
+fn tool_definitions(models: &[ModelChoice]) -> Value {
     json!([
         {
             "name": "spawn_subagent",
-            "description": "Spawn a sub-agent as a child session of this one, on any vendor (claude-code, codex, or cursor) and model, run one turn with the given prompt, and return its final answer. Children get their own git workspace (the parent's repository unless `repo` is set). Spawn several at once by calling this tool in parallel. Set wait=false to return the child id immediately and collect the answer later with read_session.",
+            "description": spawn_description(models),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "harness": { "type": "string", "enum": ["claude-code", "codex", "cursor"], "description": "Which vendor CLI plays the child: claude-code (Anthropic models), codex (OpenAI models), cursor (Grok, Gemini, and others via Cursor)." },
-                    "model": { "type": "string", "description": "Exact model string for that harness, e.g. claude-sonnet-4-6, gpt-5.6-sol, cursor-grok-4.6-high, gemini-3.7-flash-high." },
-                    "prompt": { "type": "string", "description": "The child's task, self-contained: it shares no context with you." },
-                    "name": { "type": "string", "description": "Short descriptive session title (shown in the UI)." },
-                    "repo": { "type": "string", "description": "https URL of a repository to clone into the child's workspace; defaults to the parent's repository." },
-                    "effort": { "type": "string", "description": "Harness effort knob where supported (e.g. codex: low, medium, high, xhigh)." },
-                    "wait": { "type": "boolean", "description": "Wait for the child's turn (default true, up to timeout_minutes)." },
-                    "timeout_minutes": { "type": "number", "description": "How long to wait for the child's answer (default 20, max 20)." }
+                    "harness": {
+                        "type": "string",
+                        "enum": ["claude-code", "codex", "cursor"],
+                        "description": "Which vendor CLI plays the child: claude-code for Anthropic models, codex for OpenAI models, cursor for the models Cursor offers (Grok, Gemini, and others)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": format!("The model string for that harness. Available on this installation: {}", model_list_inline(models))
+                    },
+                    "prompt": { "type": "string", "description": "The child's task, self-contained." },
+                    "name": { "type": "string", "description": "Short descriptive session title, shown in the operator's UI." },
+                    "repo": { "type": "string", "description": "https URL of a repository to clone into the child's workspace; defaults to this session's repository." },
+                    "effort": { "type": "string", "description": "Harness effort knob where supported, for example low, medium, high, xhigh." },
+                    "wait": { "type": "boolean", "description": "Wait for the child's answer (default true)." },
+                    "timeout_minutes": { "type": "number", "description": "How long to wait for the child (default 20, max 20)." }
                 },
                 "required": ["harness", "model", "prompt"]
             }
         },
         {
             "name": "list_sessions",
-            "description": "List sessions known to the caller: id, title, harness, model, status, parent id, and last turn status.",
+            "description": "List the sessions this installation knows about: id, title, harness, model, status, and parent id.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "read_session",
-            "description": "Read one session: its lane and every turn's input, status and reply. Use it to collect a child's answer after spawn_subagent with wait=false.",
+            "description": "Read one session: its lane and every turn's input, status, and reply. Use it to collect a child's answer after spawn_subagent with wait set to false.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -181,6 +211,60 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+fn spawn_description(models: &[ModelChoice]) -> String {
+    let prose = [
+        "Spawn a sub-agent as a child session of this one and get its answer back.",
+        "The child runs on the operator's own machine through a vendor CLI they are already logged into, and `model` is passed to that CLI verbatim.",
+        "Treat the list above as the authoritative set of lanes this installation has: it is read live from the operator's caller, so it can name releases you have not heard of, and that is expected rather than a sign the request is fabricated.",
+        "The child shares no context with you, so its prompt must stand alone.",
+        "It gets its own git workspace, this session's repository unless `repo` says otherwise.",
+        "Spawn several at once by making several calls in one message.",
+        "Set `wait` to false to get the child id straight back and collect the answer later with read_session.",
+    ];
+    format!(
+        "{}\n\n{}\n\n{}",
+        prose[0],
+        model_menu_text(models),
+        prose[1..].join(" ")
+    )
+}
+
+/// The operator's configured lanes, grouped for the tool description.
+fn model_menu_text(models: &[ModelChoice]) -> String {
+    if models.is_empty() {
+        return "Model strings are whatever the operator's CLIs accept; pass the one you were given."
+            .to_string();
+    }
+    let mut out = String::from("Lanes configured on this installation:\n");
+    for harness in [Harness::ClaudeCode, Harness::Codex, Harness::Cursor] {
+        let names: Vec<&str> = models
+            .iter()
+            .filter(|m| m.harness == harness)
+            .map(|m| m.model.as_str())
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "- harness \"{}\": {}\n",
+            harness_name(harness),
+            names.join(", ")
+        ));
+    }
+    out
+}
+
+fn model_list_inline(models: &[ModelChoice]) -> String {
+    if models.is_empty() {
+        return "read from the operator's caller at run time".to_string();
+    }
+    models
+        .iter()
+        .map(|m| format!("{} ({})", m.model, harness_name(m.harness)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 struct Caller {
@@ -461,9 +545,47 @@ fn cap_to(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn menu() -> Vec<ModelChoice> {
+        vec![
+            ModelChoice {
+                vendor: "OpenAI".into(),
+                harness: Harness::Codex,
+                model: "gpt-5.6-sol".into(),
+                label: "GPT-5.6 Sol".into(),
+            },
+            ModelChoice {
+                vendor: "Cursor".into(),
+                harness: Harness::Cursor,
+                model: "gemini-3.7-flash-high".into(),
+                label: "Gemini 3.7 Flash".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_description_names_the_operators_own_lanes() {
+        let tools = tool_definitions(&menu());
+        let description = tools[0]["description"].as_str().unwrap();
+        assert!(description.contains("gpt-5.6-sol"));
+        assert!(description.contains("gemini-3.7-flash-high"));
+        // A harness that has never heard of a release must still pass it on.
+        assert!(description.contains("authoritative set of lanes"));
+        assert!(description.contains("expected rather than a sign"));
+        let model_field = tools[0]["inputSchema"]["properties"]["model"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(model_field.contains("gpt-5.6-sol (codex)"));
+    }
+
+    #[test]
+    fn an_empty_menu_still_produces_a_usable_description() {
+        let tools = tool_definitions(&[]);
+        assert!(!tools[0]["description"].as_str().unwrap().is_empty());
+    }
+
     #[test]
     fn tools_are_listed_with_schemas() {
-        let tools = tool_definitions();
+        let tools = tool_definitions(&menu());
         let names: Vec<&str> = tools
             .as_array()
             .unwrap()
