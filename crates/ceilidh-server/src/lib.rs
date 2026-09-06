@@ -38,6 +38,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 const ONLINE_WINDOW_SECS: i64 = 60;
+/// A turn claimed this recently may not yet be in its runner's heartbeat set.
+const HELD_TURN_GRACE_SECS: i64 = 15;
 const CLAIM_WAIT_CAP_SECS: u32 = 30;
 const SSE_KEEP_ALIVE_SECS: u64 = 15;
 const HISTORY_HINT_LIMIT: i64 = 8;
@@ -1157,6 +1159,17 @@ async fn heartbeat(
     .execute(&state.pool)
     .await?;
 
+    let released = release_turns_not_held(&state.pool, &payload.runner, &payload.active_turns, now).await?;
+    for (turn_id, session_id, status) in released {
+        tracing::warn!(turn_id = %turn_id, runner = %payload.runner, ?status, "released a turn its runner no longer holds");
+        if status == TurnStatus::Cancelled {
+            if let Ok(turn) = get_turn_by_id(&state.pool, turn_id).await {
+                state.emit(Some(session_id), Event::TurnCancelled { turn });
+            }
+        }
+    }
+    state.notify.notify_waiters();
+
     state.emit(
         None,
         Event::RunnerStatus {
@@ -1170,6 +1183,79 @@ async fn heartbeat(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A runner that restarted (launchd KeepAlive, a crash, a redeploy) comes back
+/// under the same id within the online window, so the stale sweep never sees
+/// it as dead; its heartbeat says which turns it actually holds. Anything this
+/// runner was assigned but does not list goes back on the queue (or finishes
+/// as cancelled if the human already asked), after a short grace for turns
+/// claimed a moment ago.
+async fn release_turns_not_held(
+    pool: &SqlitePool,
+    runner: &str,
+    held: &[TurnId],
+    now: DateTime<Utc>,
+) -> Result<Vec<(TurnId, SessionId, TurnStatus)>, ApiError> {
+    let cutoff = now - TimeDelta::seconds(HELD_TURN_GRACE_SECS);
+    let rows = sqlx::query(
+        r#"
+        SELECT t.id AS id, t.session_id AS session_id, t.cancel_requested_at AS cancel_requested_at
+        FROM turns t
+        JOIN sessions s ON s.id = t.session_id
+        WHERE t.status IN (?, ?)
+          AND s.runner_affinity = ?
+          AND t.started_at IS NOT NULL
+          AND t.started_at < ?
+        "#,
+    )
+    .bind(enum_string(&TurnStatus::Claimed)?)
+    .bind(enum_string(&TurnStatus::Working)?)
+    .bind(runner)
+    .bind(dt_string(cutoff))
+    .fetch_all(pool)
+    .await?;
+
+    let mut released = Vec::new();
+    for row in rows {
+        let raw: String = row.try_get("id")?;
+        let Ok(turn_id) = Uuid::parse_str(&raw) else {
+            continue;
+        };
+        if held.contains(&turn_id) {
+            continue;
+        }
+        let session_id = parse_uuid(row.try_get::<String, _>("session_id")?)?;
+        let cancel_requested = row
+            .try_get::<Option<String>, _>("cancel_requested_at")?
+            .is_some();
+        let next_status = if cancel_requested {
+            TurnStatus::Cancelled
+        } else {
+            TurnStatus::Queued
+        };
+        let result = sqlx::query(
+            r#"
+            UPDATE turns
+            SET status = ?, started_at = NULL,
+                finished_at = CASE WHEN ? = 'cancelled' THEN ? ELSE finished_at END
+            WHERE id = ?
+              AND status IN (?, ?)
+            "#,
+        )
+        .bind(enum_string(&next_status)?)
+        .bind(enum_string(&next_status)?)
+        .bind(dt_string(now))
+        .bind(&raw)
+        .bind(enum_string(&TurnStatus::Claimed)?)
+        .bind(enum_string(&TurnStatus::Working)?)
+        .execute(pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            released.push((turn_id, session_id, next_status));
+        }
+    }
+    Ok(released)
 }
 
 async fn get_session_by_id(pool: &SqlitePool, id: SessionId) -> Result<Session, ApiError> {

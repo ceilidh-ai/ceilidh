@@ -287,6 +287,24 @@ where
     decode_json(response).await
 }
 
+async fn send_status<T>(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    payload: &T,
+) -> Result<StatusCode>
+where
+    T: Serialize,
+{
+    let response = app
+        .clone()
+        .oneshot(json_request(method, uri, token, payload)?)
+        .await
+        .unwrap();
+    Ok(response.status())
+}
+
 fn json_request<T>(
     method: Method,
     uri: &str,
@@ -571,6 +589,147 @@ async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
         ClaimResponse::Work { work } => assert_eq!(work.turn.id, turn.id),
         ClaimResponse::Empty => bail!("abandoned turn should have been requeued"),
     }
+
+    Ok(())
+}
+
+
+/// A runner that restarts under the same id heartbeats with an empty held set;
+/// the turn it was playing must go back on the queue instead of wedging the
+/// session until the online window would have expired (it never does, because
+/// the restarted runner keeps heartbeating).
+#[tokio::test]
+async fn heartbeat_releases_turns_the_runner_no_longer_holds() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-reconcile-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: None,
+        default_repo_url: None,
+    })
+    .await?;
+
+    let session: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "reconcile".to_string(),
+            lane: Some(Lane {
+                harness: Harness::Mock,
+                model: "mock".to_string(),
+                effort: None,
+            }),
+            profile: None,
+            parent_id: None,
+        },
+    )
+    .await?;
+
+    let turn: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &PostTurnRequest {
+            input: "hello".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    let claimed: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "restarting-runner".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+        },
+    )
+    .await?;
+    assert!(matches!(claimed, ClaimResponse::Work { .. }));
+
+    // Within the grace window a heartbeat that omits the turn changes nothing.
+    let status = send_status(
+        &app,
+        Method::POST,
+        "/api/runner/heartbeat",
+        None,
+        &ceilidh_protocol::Heartbeat {
+            runner: "restarting-runner".to_string(),
+            active_turns: vec![],
+            at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let turns: Vec<Turn> = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(turns[0].status, TurnStatus::Claimed);
+
+    // Age the claim past the grace window: the restarted runner's next
+    // heartbeat releases it.
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.join("ceilidh.db").display()
+    ))
+    .await?;
+    sqlx::query("UPDATE turns SET started_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00Z")
+        .bind(turn.id.to_string())
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+
+    let status = send_status(
+        &app,
+        Method::POST,
+        "/api/runner/heartbeat",
+        None,
+        &ceilidh_protocol::Heartbeat {
+            runner: "restarting-runner".to_string(),
+            active_turns: vec![],
+            at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let turns: Vec<Turn> = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(turns[0].status, TurnStatus::Queued, "released back to the queue");
+
+    let again: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "restarting-runner".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+        },
+    )
+    .await?;
+    assert!(matches!(again, ClaimResponse::Work { .. }), "the released turn is claimable again");
 
     Ok(())
 }
