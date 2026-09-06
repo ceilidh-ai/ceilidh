@@ -16,6 +16,8 @@ import type {
   Harness,
   Lane,
   ModelChoice,
+  RepoList,
+  RepoOwner,
   RunnerStatusInfo,
   Session,
   SessionId,
@@ -39,6 +41,8 @@ const maxTreeDepth = 3
 const sessionHydrationLimit = 40
 const otherModelKey = '__other__'
 const emptyConfig: CallerConfig = { default_repo_url: null, models: [] }
+const emptyRepos: RepoList = { owners: [], available: false }
+const otherRepoKey = '__other__'
 const dotClasses: Record<TurnStatus, string> = {
   queued: 'animate-pulse bg-amber-300 shadow-[0_0_0_4px_rgba(252,211,77,0.14)]',
   claimed: 'animate-pulse bg-sky-300 shadow-[0_0_0_4px_rgba(125,211,252,0.14)]',
@@ -120,6 +124,7 @@ function Workbench({
   const [pane, setPane] = useState<Pane>('sessions')
   const [creating, setCreating] = useState(false)
   const [config, setConfig] = useState<CallerConfig | null>(null)
+  const [repos, setRepos] = useState<RepoList>(emptyRepos)
   const [loadingOverview, setLoadingOverview] = useState(true)
   const [overviewError, setOverviewError] = useState<string | null>(null)
   const [sendingSessionId, setSendingSessionId] = useState<SessionId | null>(
@@ -167,11 +172,12 @@ function Workbench({
     setOverviewError(null)
 
     try {
-      const [configPayload, sessionsPayload, runnersPayload] =
+      const [configPayload, reposPayload, sessionsPayload, runnersPayload] =
         await Promise.all([
           // A config the caller cannot serve still leaves the form usable
           // through its free-text model path.
           apiFetch<unknown>('/api/config').catch(() => null),
+          apiFetch<unknown>('/api/repos').catch(() => null),
           apiFetch<unknown>('/api/sessions'),
           apiFetch<unknown>('/api/runners'),
         ])
@@ -185,6 +191,7 @@ function Workbench({
       )
 
       setConfig(configFromPayload(configPayload))
+      setRepos(reposFromPayload(reposPayload))
       setState((current) => setRunners(setSessions(current, sessions), runners))
       setSelectedSessionId((current) => current ?? sessions[0]?.id ?? null)
       await hydrateTurns(sessions.slice(0, sessionHydrationLimit))
@@ -322,6 +329,7 @@ function Workbench({
         config={config}
         onCancel={closeMainPane}
         onCreate={createSession}
+        repos={repos}
       />
     ) : (
       <section className="flex min-h-0 flex-1 items-center justify-center p-4">
@@ -579,7 +587,9 @@ function NewSessionForm({
   config,
   onCancel,
   onCreate,
+  repos,
 }: {
+  repos: RepoList
   config: CallerConfig
   onCancel: () => void
   onCreate: (request: CreateSessionRequest) => Promise<void>
@@ -594,7 +604,17 @@ function NewSessionForm({
     defaultModelForHarness('claude-code'),
   )
   const [effort, setEffort] = useState('')
-  const [repoUrl, setRepoUrl] = useState(() => config.default_repo_url ?? '')
+  const defaultRepo = config.default_repo_url ?? ''
+  const knownRepo = findRepo(repos, defaultRepo)
+  // The picker only appears when the caller has a GitHub token; without one
+  // the free-text field is the whole story, exactly as before.
+  const [ownerLogin, setOwnerLogin] = useState(
+    () => knownRepo?.owner ?? repos.owners[0]?.login ?? '',
+  )
+  const [repoKey, setRepoKey] = useState(
+    () => knownRepo?.url ?? (repos.available ? otherRepoKey : ''),
+  )
+  const [repoUrl, setRepoUrl] = useState(() => defaultRepo)
   const [baseBranch, setBaseBranch] = useState('')
   const [pushChoice, setPushChoice] = useState<boolean | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -602,7 +622,13 @@ function NewSessionForm({
 
   const choice = config.models.find((item) => modelKey(item) === choiceKey)
   const custom = !choice
-  const repoSet = repoUrl.trim().length > 0
+  const owner = repos.owners.find((item) => item.login === ownerLogin)
+  const pickedRepo =
+    repos.available && repoKey !== otherRepoKey
+      ? owner?.repos.find((item) => item.url === repoKey)
+      : undefined
+  const effectiveRepoUrl = pickedRepo ? pickedRepo.url : repoUrl
+  const repoSet = effectiveRepoUrl.trim().length > 0
   // A scratch workspace has nothing to push to, so the toggle only bites when
   // a repository is set, and it is on by default when one is.
   const allowPush = repoSet && (pushChoice ?? true)
@@ -632,7 +658,7 @@ function NewSessionForm({
       title: cleanedTitle,
       lane,
       profile: {
-        ...optionalField('repo_url', repoUrl),
+        ...optionalField('repo_url', effectiveRepoUrl),
         ...optionalField('base_branch', baseBranch),
         allow_push: allowPush,
       },
@@ -758,19 +784,63 @@ function NewSessionForm({
           </div>
         ) : null}
 
-        <label className="grid gap-2 text-sm font-medium text-slate-300">
-          Repository
-          <input
-            autoCapitalize="off"
-            autoCorrect="off"
-            className="form-field"
-            inputMode="url"
-            onChange={(event) => setRepoUrl(event.target.value)}
-            placeholder="empty for a scratch workspace"
-            spellCheck={false}
-            value={repoUrl}
-          />
-        </label>
+        {repos.available ? (
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="grid gap-2 text-sm font-medium text-slate-300">
+              Owner
+              <select
+                className="form-field"
+                onChange={(event) => {
+                  const nextOwner = event.target.value
+                  setOwnerLogin(nextOwner)
+                  const first = repos.owners.find(
+                    (item) => item.login === nextOwner,
+                  )?.repos[0]
+                  setRepoKey(first?.url ?? otherRepoKey)
+                }}
+                value={ownerLogin}
+              >
+                {repos.owners.map((item) => (
+                  <option key={item.login} value={item.login}>
+                    {item.login}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="grid gap-2 text-sm font-medium text-slate-300">
+              Repository
+              <select
+                className="form-field"
+                onChange={(event) => setRepoKey(event.target.value)}
+                value={repoKey}
+              >
+                {(owner?.repos ?? []).map((item) => (
+                  <option key={item.url} value={item.url}>
+                    {item.name}
+                  </option>
+                ))}
+                <option value={otherRepoKey}>Other or none...</option>
+              </select>
+            </label>
+          </div>
+        ) : null}
+
+        {!repos.available || repoKey === otherRepoKey ? (
+          <label className="grid gap-2 text-sm font-medium text-slate-300">
+            {repos.available ? 'Repository URL' : 'Repository'}
+            <input
+              autoCapitalize="off"
+              autoCorrect="off"
+              className="form-field"
+              inputMode="url"
+              onChange={(event) => setRepoUrl(event.target.value)}
+              placeholder="empty for a scratch workspace"
+              spellCheck={false}
+              value={repoUrl}
+            />
+          </label>
+        ) : null}
 
         <label className="grid gap-2 text-sm font-medium text-slate-300">
           Base branch
@@ -1578,6 +1648,32 @@ function groupModels(models: ModelChoice[]) {
   }
 
   return groups
+}
+
+/** The repository the caller prefills, if the picker happens to carry it. */
+function findRepo(repos: RepoList, url: string) {
+  if (!repos.available || !url) {
+    return undefined
+  }
+
+  const wanted = url.replace(/\.git$/, '')
+  for (const owner of repos.owners) {
+    for (const repo of owner.repos) {
+      if (repo.url.replace(/\.git$/, '') === wanted) {
+        return repo
+      }
+    }
+  }
+  return undefined
+}
+
+function reposFromPayload(payload: unknown): RepoList {
+  if (!isRecord(payload) || payload.available !== true) {
+    return emptyRepos
+  }
+
+  const owners = collectionFromPayload<RepoOwner>(payload.owners, 'owners')
+  return { owners, available: owners.length > 0 }
 }
 
 function configFromPayload(payload: unknown): CallerConfig {

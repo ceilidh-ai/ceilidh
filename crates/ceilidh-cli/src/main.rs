@@ -105,6 +105,10 @@ struct ServeArgs {
     /// Repository prefilled into the new-session form (env: CEILIDH_DEFAULT_REPO)
     #[arg(long, env = "CEILIDH_DEFAULT_REPO")]
     default_repo: Option<String>,
+    /// Read-only GitHub token, so the new-session form can offer a repository
+    /// picker instead of a free-text field (env: CEILIDH_GITHUB_TOKEN)
+    #[arg(long, env = "CEILIDH_GITHUB_TOKEN")]
+    github_token: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -185,6 +189,7 @@ async fn main() -> Result<()> {
                     db_path: a.db,
                     token: a.token,
                     default_repo_url: a.default_repo,
+                    github_token: a.github_token,
                 },
                 web_dir,
             )
@@ -219,6 +224,7 @@ async fn main() -> Result<()> {
                 db_path: a.serve.db,
                 token: a.serve.token.clone(),
                 default_repo_url: a.serve.default_repo.clone(),
+                github_token: a.serve.github_token.clone(),
             };
 
             let mut harnesses: Vec<ceilidh_protocol::Harness> =

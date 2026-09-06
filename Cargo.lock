@@ -313,6 +313,7 @@ dependencies = [
  "chrono",
  "futures-core",
  "futures-util",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
