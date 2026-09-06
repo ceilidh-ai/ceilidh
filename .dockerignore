@@ -1,0 +1,8 @@
+target
+web/node_modules
+web/dist
+.git
+.ceilidh
+*.db
+*.db-wal
+*.db-shm
