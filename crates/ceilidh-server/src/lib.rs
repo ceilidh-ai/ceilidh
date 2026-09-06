@@ -29,7 +29,9 @@ use futures_util::stream;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+};
 use sqlx::{Row, SqlitePool};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast};
@@ -265,13 +267,22 @@ async fn open_pool(db_path: &Path) -> anyhow::Result<SqlitePool> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Several runners long-poll, heartbeat, and stream chunks against one
+    // SQLite file, and the default rollback journal serializes them so hard
+    // that an ordinary request can lose the race and 500 (observed with three
+    // runners connected). WAL lets readers run beside the writer, and the busy
+    // timeout makes a contended write wait its turn instead of failing.
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(10));
 
     Ok(SqlitePoolOptions::new()
         .max_connections(8)
+        .acquire_timeout(Duration::from_secs(15))
         .connect_with(options)
         .await?)
 }
