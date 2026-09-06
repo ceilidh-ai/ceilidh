@@ -21,9 +21,9 @@ use axum::response::{Html, IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ceilidh_protocol::{
-    ClaimRequest, ClaimResponse, ClaimedWork, CreateSessionRequest, Envelope, Event, Harness,
-    Heartbeat, PostTurnRequest, ReportRequest, RunnerId, RunnerStatusInfo, Session, SessionId,
-    SessionStatus, Turn, TurnId, TurnStatus, TurnSummary,
+    CallerConfig, ClaimRequest, ClaimResponse, ClaimedWork, CreateSessionRequest, Envelope, Event,
+    Harness, Heartbeat, ModelChoice, PostTurnRequest, ReportRequest, RunnerId, RunnerStatusInfo,
+    Session, SessionId, SessionStatus, Turn, TurnControl, TurnId, TurnStatus, TurnSummary,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use futures_core::Stream;
@@ -49,6 +49,8 @@ pub struct ServeOptions {
     pub db_path: PathBuf,
     /// Bearer token required on every API request when set.
     pub token: Option<String>,
+    /// Repository prefilled into the new-session form (https URL).
+    pub default_repo_url: Option<String>,
 }
 
 pub async fn serve(opts: ServeOptions) -> anyhow::Result<()> {
@@ -84,20 +86,27 @@ pub async fn build_app_with_web_dir(
         events,
         notify: Arc::new(Notify::new()),
         token: opts.token.filter(|token| !token.is_empty()).map(Arc::from),
+        config: Arc::new(CallerConfig {
+            default_repo_url: opts.default_repo_url.filter(|url| !url.trim().is_empty()),
+            models: model_menu(),
+        }),
     };
 
     let api = Router::new()
+        .route("/config", get(get_config))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/{id}", get(get_session))
         .route(
             "/sessions/{id}/turns",
             post(post_turn).get(list_session_turns),
         )
+        .route("/sessions/{id}/turns/{turn_id}/cancel", post(cancel_turn))
         .route("/sessions/{id}/events", get(session_events))
         .route("/events", get(all_events))
         .route("/runners", get(list_runners))
         .route("/runner/claim", post(claim_turn))
         .route("/runner/turns/{id}/chunk", post(post_chunk))
+        .route("/runner/turns/{id}/control", get(turn_control))
         .route("/runner/turns/{id}/report", post(report_turn))
         .route("/runner/heartbeat", post(heartbeat))
         .route_layer(middleware::from_fn_with_state(
@@ -125,6 +134,48 @@ struct AppState {
     events: broadcast::Sender<BroadcastEvent>,
     notify: Arc<Notify>,
     token: Option<Arc<str>>,
+    config: Arc<CallerConfig>,
+}
+
+/// The model menu the UI offers, grouped by vendor. Every row is a string
+/// the harness CLI accepts verbatim; the form also takes a free-text model
+/// so a new release never waits on a rebuild.
+fn model_menu() -> Vec<ModelChoice> {
+    fn row(vendor: &str, harness: Harness, model: &str, label: &str) -> ModelChoice {
+        ModelChoice {
+            vendor: vendor.to_string(),
+            harness,
+            model: model.to_string(),
+            label: label.to_string(),
+        }
+    }
+    let a = |m: &str, l: &str| row("Anthropic", Harness::ClaudeCode, m, l);
+    let o = |m: &str, l: &str| row("OpenAI", Harness::Codex, m, l);
+    let c = |m: &str, l: &str| row("Cursor", Harness::Cursor, m, l);
+    vec![
+        a("claude-fable-5-1", "Claude Fable 5.1"),
+        a("claude-opus-5", "Claude Opus 5"),
+        a("claude-opus-4-8", "Claude Opus 4.8"),
+        a("claude-sonnet-5", "Claude Sonnet 5"),
+        a("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        a("claude-haiku-4-5", "Claude Haiku 4.5"),
+        o("gpt-5.6-sol", "GPT-5.6 Sol"),
+        o("gpt-5.6-terra", "GPT-5.6 Terra"),
+        o("gpt-5.6-luna", "GPT-5.6 Luna"),
+        o("gpt-5.5", "GPT-5.5"),
+        c("cursor-grok-4.6-high", "Grok 4.6"),
+        c("cursor-grok-4.6-xhigh", "Grok 4.6 Extra High"),
+        c("gemini-3.7-flash-high", "Gemini 3.7 Flash"),
+        c("gpt-5.6-sol-high", "GPT-5.6 Sol High (Cursor)"),
+        c("gpt-5.6-luna-high", "GPT-5.6 Luna High (Cursor)"),
+        c("composer-2.5", "Composer 2.5"),
+        c("claude-opus-5-thinking-high", "Claude Opus 5 Thinking (Cursor)"),
+        c("claude-sonnet-5-thinking-high", "Claude Sonnet 5 Thinking (Cursor)"),
+    ]
+}
+
+async fn get_config(State(state): State<AppState>) -> Json<CallerConfig> {
+    Json((*state.config).clone())
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +319,12 @@ async fn create_session(
         return Err(ApiError::unprocessable("title is required"));
     }
 
+    if let Some(parent_id) = payload.parent_id {
+        ensure_session_exists(&state.pool, parent_id)
+            .await
+            .map_err(|_| ApiError::unprocessable("parent_id does not name a session"))?;
+    }
+
     let now = Utc::now();
     let session = Session {
         id: Uuid::new_v4(),
@@ -276,6 +333,7 @@ async fn create_session(
         profile: payload.profile.unwrap_or_default(),
         runner_affinity: None,
         status: SessionStatus::Active,
+        parent_id: payload.parent_id,
         created_at: now,
         updated_at: now,
     };
@@ -283,8 +341,9 @@ async fn create_session(
     sqlx::query(
         r#"
         INSERT INTO sessions
-            (id, title, lane_json, profile_json, runner_affinity, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, title, lane_json, profile_json, runner_affinity, status, parent_id,
+             created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(session.id.to_string())
@@ -293,10 +352,18 @@ async fn create_session(
     .bind(json_string(&session.profile)?)
     .bind(&session.runner_affinity)
     .bind(enum_string(&session.status)?)
+    .bind(session.parent_id.map(|id| id.to_string()))
     .bind(dt_string(session.created_at))
     .bind(dt_string(session.updated_at))
     .execute(&state.pool)
     .await?;
+
+    state.emit(
+        session.parent_id,
+        Event::SessionCreated {
+            session: session.clone(),
+        },
+    );
 
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -304,7 +371,8 @@ async fn create_session(
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session>>, ApiError> {
     let rows = sqlx::query(
         r#"
-        SELECT id, title, lane_json, profile_json, runner_affinity, status, created_at, updated_at
+        SELECT id, title, lane_json, profile_json, runner_affinity, status, parent_id,
+               created_at, updated_at
         FROM sessions
         ORDER BY created_at DESC
         "#,
@@ -338,7 +406,8 @@ async fn post_turn(
     let mut tx = state.pool.begin().await?;
     let session_row = sqlx::query(
         r#"
-        SELECT id, title, lane_json, profile_json, runner_affinity, status, created_at, updated_at
+        SELECT id, title, lane_json, profile_json, runner_affinity, status, parent_id,
+               created_at, updated_at
         FROM sessions
         WHERE id = ?
         "#,
@@ -397,6 +466,7 @@ async fn post_turn(
         error: None,
         commit: None,
         resume_token: None,
+        cancel_requested: false,
         created_at: now,
         started_at: None,
         finished_at: None,
@@ -446,7 +516,8 @@ async fn list_session_turns(
     let rows = sqlx::query(
         r#"
         SELECT id, session_id, seq, input, lane_override_json, status, envelope_json, error,
-               commit_sha, resume_token, created_at, started_at, finished_at
+               commit_sha, resume_token, cancel_requested_at, created_at, started_at,
+               finished_at
         FROM turns
         WHERE session_id = ?
         ORDER BY seq ASC
@@ -608,6 +679,7 @@ async fn try_claim(
             t.error AS t_error,
             t.commit_sha AS t_commit_sha,
             t.resume_token AS t_resume_token,
+            t.cancel_requested_at AS t_cancel_requested_at,
             t.created_at AS t_created_at,
             t.started_at AS t_started_at,
             t.finished_at AS t_finished_at,
@@ -617,6 +689,7 @@ async fn try_claim(
             s.profile_json AS s_profile_json,
             s.runner_affinity AS s_runner_affinity,
             s.status AS s_status,
+            s.parent_id AS s_parent_id,
             s.created_at AS s_created_at,
             s.updated_at AS s_updated_at
         FROM turns t
@@ -727,7 +800,7 @@ async fn reclaim_stale_turns(
 
     let rows = sqlx::query(
         r#"
-        SELECT t.id AS id
+        SELECT t.id AS id, t.cancel_requested_at AS cancel_requested_at
         FROM turns t
         JOIN sessions s ON s.id = t.session_id
         WHERE t.status IN (?, ?)
@@ -753,6 +826,17 @@ async fn reclaim_stale_turns(
         let Ok(turn_id) = Uuid::parse_str(&raw) else {
             continue;
         };
+        let cancel_requested = row
+            .try_get::<Option<String>, _>("cancel_requested_at")?
+            .is_some();
+
+        // A cancelled turn whose runner died is finished, not requeued: the
+        // human already said stop.
+        let next_status = if cancel_requested {
+            TurnStatus::Cancelled
+        } else {
+            TurnStatus::Queued
+        };
 
         let result = sqlx::query(
             r#"
@@ -762,7 +846,7 @@ async fn reclaim_stale_turns(
               AND status IN (?, ?)
             "#,
         )
-        .bind(enum_string(&TurnStatus::Queued)?)
+        .bind(enum_string(&next_status)?)
         .bind(&raw)
         .bind(enum_string(&TurnStatus::Claimed)?)
         .bind(enum_string(&TurnStatus::Working)?)
@@ -910,10 +994,10 @@ async fn report_turn(
     let payload = parse_json(payload)?;
     if !matches!(
         payload.status,
-        TurnStatus::Done | TurnStatus::Error | TurnStatus::Capped
+        TurnStatus::Done | TurnStatus::Error | TurnStatus::Capped | TurnStatus::Cancelled
     ) {
         return Err(ApiError::unprocessable(
-            "report status must be done, error, or capped",
+            "report status must be done, error, capped, or cancelled",
         ));
     }
 
@@ -966,11 +1050,85 @@ async fn report_turn(
                     .unwrap_or_else(|| "turn did not complete".to_string()),
             },
         ),
+        TurnStatus::Cancelled => state.emit(
+            Some(turn.session_id),
+            Event::TurnCancelled { turn: turn.clone() },
+        ),
         _ => {}
     }
     state.notify.notify_waiters();
 
     Ok(Json(turn))
+}
+
+/// Cancel a turn. A queued turn is cancelled here and now; a claimed or
+/// working turn is flagged, and the runner holding it kills the harness and
+/// reports `cancelled`.
+async fn cancel_turn(
+    State(state): State<AppState>,
+    AxumPath((session_id, turn_id)): AxumPath<(SessionId, TurnId)>,
+) -> Result<Json<Turn>, ApiError> {
+    let turn = get_turn_by_id(&state.pool, turn_id).await?;
+    if turn.session_id != session_id {
+        return Err(ApiError::not_found("turn"));
+    }
+
+    let now = Utc::now();
+    match turn.status {
+        TurnStatus::Queued => {
+            let result = sqlx::query(
+                r#"
+                UPDATE turns
+                SET status = ?, cancel_requested_at = ?, finished_at = ?
+                WHERE id = ?
+                  AND status = ?
+                "#,
+            )
+            .bind(enum_string(&TurnStatus::Cancelled)?)
+            .bind(dt_string(now))
+            .bind(dt_string(now))
+            .bind(turn_id.to_string())
+            .bind(enum_string(&TurnStatus::Queued)?)
+            .execute(&state.pool)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(ApiError::conflict("turn is no longer queued"));
+            }
+            let turn = get_turn_by_id(&state.pool, turn_id).await?;
+            state.emit(
+                Some(session_id),
+                Event::TurnCancelled { turn: turn.clone() },
+            );
+            state.notify.notify_waiters();
+            Ok(Json(turn))
+        }
+        TurnStatus::Claimed | TurnStatus::Working => {
+            sqlx::query(
+                r#"
+                UPDATE turns
+                SET cancel_requested_at = COALESCE(cancel_requested_at, ?)
+                WHERE id = ?
+                "#,
+            )
+            .bind(dt_string(now))
+            .bind(turn_id.to_string())
+            .execute(&state.pool)
+            .await?;
+            Ok(Json(get_turn_by_id(&state.pool, turn_id).await?))
+        }
+        _ => Err(ApiError::conflict("turn has already finished")),
+    }
+}
+
+/// Polled by the runner holding a turn: has the human asked for a cancel?
+async fn turn_control(
+    State(state): State<AppState>,
+    AxumPath(turn_id): AxumPath<TurnId>,
+) -> Result<Json<TurnControl>, ApiError> {
+    let turn = get_turn_by_id(&state.pool, turn_id).await?;
+    Ok(Json(TurnControl {
+        cancel_requested: turn.cancel_requested,
+    }))
 }
 
 async fn heartbeat(
@@ -1017,7 +1175,8 @@ async fn heartbeat(
 async fn get_session_by_id(pool: &SqlitePool, id: SessionId) -> Result<Session, ApiError> {
     let row = sqlx::query(
         r#"
-        SELECT id, title, lane_json, profile_json, runner_affinity, status, created_at, updated_at
+        SELECT id, title, lane_json, profile_json, runner_affinity, status, parent_id,
+               created_at, updated_at
         FROM sessions
         WHERE id = ?
         "#,
@@ -1054,7 +1213,8 @@ async fn get_turn_by_id(pool: &SqlitePool, id: TurnId) -> Result<Turn, ApiError>
     let row = sqlx::query(
         r#"
         SELECT id, session_id, seq, input, lane_override_json, status, envelope_json, error,
-               commit_sha, resume_token, created_at, started_at, finished_at
+               commit_sha, resume_token, cancel_requested_at, created_at, started_at,
+               finished_at
         FROM turns
         WHERE id = ?
         "#,
@@ -1078,7 +1238,7 @@ async fn history_hint(
         FROM turns
         WHERE session_id = ?
           AND seq < ?
-          AND status IN (?, ?, ?)
+          AND status IN (?, ?, ?, ?)
         ORDER BY seq DESC
         LIMIT ?
         "#,
@@ -1088,6 +1248,7 @@ async fn history_hint(
     .bind(enum_string(&TurnStatus::Done)?)
     .bind(enum_string(&TurnStatus::Error)?)
     .bind(enum_string(&TurnStatus::Capped)?)
+    .bind(enum_string(&TurnStatus::Cancelled)?)
     .bind(HISTORY_HINT_LIMIT)
     .fetch_all(pool)
     .await?;
@@ -1118,7 +1279,7 @@ fn parse_json<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError>
             Err(ApiError::new(
                 status,
                 format!(
-                    "invalid json: {}; supported harnesses: claude-code, codex, mock",
+                    "invalid json: {}; supported harnesses: claude-code, codex, cursor, mock",
                     err.body_text()
                 ),
             ))
@@ -1134,6 +1295,10 @@ fn session_from_row(row: &SqliteRow, prefix: &str) -> Result<Session, ApiError> 
         profile: from_json_string(row.try_get(column(prefix, "profile_json").as_str())?)?,
         runner_affinity: row.try_get(column(prefix, "runner_affinity").as_str())?,
         status: enum_from_string(row.try_get(column(prefix, "status").as_str())?)?,
+        parent_id: row
+            .try_get::<Option<String>, _>(column(prefix, "parent_id").as_str())?
+            .map(parse_uuid)
+            .transpose()?,
         created_at: parse_dt(row.try_get(column(prefix, "created_at").as_str())?)?,
         updated_at: parse_dt(row.try_get(column(prefix, "updated_at").as_str())?)?,
     })
@@ -1155,6 +1320,9 @@ fn turn_from_row(row: &SqliteRow, prefix: &str) -> Result<Turn, ApiError> {
         error: row.try_get(column(prefix, "error").as_str())?,
         commit: row.try_get(column(prefix, "commit_sha").as_str())?,
         resume_token: row.try_get(column(prefix, "resume_token").as_str())?,
+        cancel_requested: row
+            .try_get::<Option<String>, _>(column(prefix, "cancel_requested_at").as_str())?
+            .is_some(),
         created_at: parse_dt(row.try_get(column(prefix, "created_at").as_str())?)?,
         started_at: option_parse_dt(row.try_get(column(prefix, "started_at").as_str())?)?,
         finished_at: option_parse_dt(row.try_get(column(prefix, "finished_at").as_str())?)?,

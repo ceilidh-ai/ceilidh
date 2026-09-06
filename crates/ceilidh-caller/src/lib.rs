@@ -24,6 +24,10 @@ pub fn transition_allowed(from: TurnStatus, to: TurnStatus) -> bool {
             | (Claimed, Queued)
             | (Working, Queued)
             | (Capped, Queued)
+            // The human cancelled: before a claim, or while a runner held it.
+            | (Queued, Cancelled)
+            | (Claimed, Cancelled)
+            | (Working, Cancelled)
     )
 }
 
@@ -50,6 +54,14 @@ mod tests {
     fn abandoned_work_can_be_requeued() {
         assert!(transition_allowed(Claimed, Queued));
         assert!(transition_allowed(Working, Queued));
+    }
+
+    #[test]
+    fn cancel_is_legal_until_the_turn_finishes() {
+        assert!(transition_allowed(Queued, Cancelled));
+        assert!(transition_allowed(Working, Cancelled));
+        assert!(!transition_allowed(Done, Cancelled));
+        assert!(!transition_allowed(Cancelled, Queued));
     }
 
     #[test]

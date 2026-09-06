@@ -11,9 +11,11 @@ name = "ceilidh"
 path = "src/main.rs"
 
 [dependencies]
+uuid = { workspace = true }
 ceilidh-protocol.workspace = true
 ceilidh-server.workspace = true
 ceilidh-runner.workspace = true
+ceilidh-mcp.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","apiKeySource":"env","cwd":"/Users/seat/ws","session_id":"b14822bb-1221-4c64-8d33-ec02b7d01889","model":"Gemini 3.7 Flash High","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"What word is in gem.txt? Reply with just the word."}]},"session_id":"b14822bb-1221-4c64-8d33-ec02b7d01889"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ceilidh"}]},"session_id":"b14822bb-1221-4c64-8d33-ec02b7d01889"}
+{"type":"result","subtype":"success","duration_ms":2700,"duration_api_ms":2700,"is_error":false,"result":"ceilidh","session_id":"b14822bb-1221-4c64-8d33-ec02b7d01889","request_id":"4c1a924e-4c6b-40bc-8c32-5d3ac6ef29cd","usage":{"inputTokens":5301,"outputTokens":97,"cacheReadTokens":7475,"cacheWriteTokens":0}}

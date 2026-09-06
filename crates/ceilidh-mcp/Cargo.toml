@@ -1,0 +1,17 @@
+[package]
+name = "ceilidh-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The sub-agent MCP server every harness attaches: spawn child sessions through the caller"
+
+[dependencies]
+ceilidh-protocol = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
