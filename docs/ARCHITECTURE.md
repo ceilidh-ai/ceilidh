@@ -83,6 +83,16 @@ names the lanes this installation actually has. That is not cosmetic: a harness
 asked to pass through a model name it has never heard of will otherwise refuse
 the call as fabricated.
 
+## Choosing a repository
+
+A session's repository is a per-session field with a configurable default
+(`CEILIDH_DEFAULT_REPO`). When the caller has a read-only GitHub token
+(`CEILIDH_GITHUB_TOKEN`), `GET /api/repos` returns every repository the
+operator can reach, grouped by owner, most recently pushed first, cached for
+five minutes; the new-session form renders it as two dropdowns with a
+free-text escape hatch. With no token the endpoint reports itself unavailable
+and the form shows the free-text field alone, so the picker is additive.
+
 ## Cancel
 
 A cancel on a queued turn finishes it immediately. On a turn a runner already

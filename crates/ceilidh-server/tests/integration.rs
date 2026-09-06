@@ -24,6 +24,7 @@ async fn runner_flow_emits_sse_and_persists_final_state() -> Result<()> {
         db_path,
         token: Some("secret".to_string()),
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 
@@ -215,6 +216,7 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
         db_path: placeholder_dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 
@@ -238,6 +240,7 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
             db_path: web_dir.join("ceilidh.db"),
             token: None,
             default_repo_url: None,
+            github_token: None,
         },
         Some(web_dir.clone()),
     )
@@ -406,6 +409,7 @@ async fn claim_carries_forward_the_previous_resume_token() -> Result<()> {
         db_path: dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 
@@ -513,6 +517,7 @@ async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
         db_path: dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 
@@ -612,6 +617,7 @@ async fn heartbeat_releases_turns_the_runner_no_longer_holds() -> Result<()> {
         db_path: dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 
@@ -757,6 +763,7 @@ async fn runner_epochs_separate_a_restart_from_an_orphan() -> Result<()> {
         db_path: dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 
@@ -908,6 +915,7 @@ async fn a_session_never_has_two_turns_claimed_at_once() -> Result<()> {
         db_path: dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 
@@ -1012,6 +1020,7 @@ async fn messages_queue_behind_a_running_turn() -> Result<()> {
         db_path: dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
+        github_token: None,
     })
     .await?;
 

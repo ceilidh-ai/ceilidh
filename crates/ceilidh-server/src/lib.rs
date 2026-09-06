@@ -18,10 +18,13 @@ use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::response::{Html, IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+mod repos;
+
 use ceilidh_protocol::{
     CallerConfig, ClaimRequest, ClaimResponse, ClaimedWork, CreateSessionRequest, Envelope, Event,
     Harness, Heartbeat, ModelChoice, PostTurnRequest, ReportRequest, RunnerId, RunnerStatusInfo,
-    Session, SessionId, SessionStatus, Turn, TurnControl, TurnId, TurnStatus, TurnSummary,
+    RepoList, Session, SessionId, SessionStatus, Turn, TurnControl, TurnId, TurnStatus,
+    TurnSummary,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use futures_core::Stream;
@@ -59,6 +62,9 @@ pub struct ServeOptions {
     pub token: Option<String>,
     /// Repository prefilled into the new-session form (https URL).
     pub default_repo_url: Option<String>,
+    /// Read-only GitHub token used to offer the repository picker. Absent
+    /// means the client falls back to a free-text repository field.
+    pub github_token: Option<String>,
 }
 
 pub async fn serve(opts: ServeOptions) -> anyhow::Result<()> {
@@ -98,10 +104,12 @@ pub async fn build_app_with_web_dir(
             default_repo_url: opts.default_repo_url.filter(|url| !url.trim().is_empty()),
             models: model_menu(),
         }),
+        repos: repos::RepoCatalog::new(opts.github_token),
     };
 
     let api = Router::new()
         .route("/config", get(get_config))
+        .route("/repos", get(get_repos))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/{id}", get(get_session))
         .route(
@@ -143,6 +151,7 @@ struct AppState {
     notify: Arc<Notify>,
     token: Option<Arc<str>>,
     config: Arc<CallerConfig>,
+    repos: repos::RepoCatalog,
 }
 
 /// The model menu the UI offers, grouped by vendor. Every row is a string
@@ -184,6 +193,10 @@ fn model_menu() -> Vec<ModelChoice> {
 
 async fn get_config(State(state): State<AppState>) -> Json<CallerConfig> {
     Json((*state.config).clone())
+}
+
+async fn get_repos(State(state): State<AppState>) -> Json<RepoList> {
+    Json(state.repos.list().await)
 }
 
 #[derive(Debug, Clone)]

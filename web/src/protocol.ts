@@ -112,3 +112,23 @@ export type Event =
   | { type: 'turn_cancelled'; turn: Turn }
   | { type: 'session_created'; session: Session }
   | { type: 'runner_status'; runner: RunnerStatusInfo }
+
+export type RepoChoice = {
+  full_name: string
+  owner: string
+  name: string
+  private: boolean
+  url: string
+  pushed_at?: string | null
+}
+
+export type RepoOwner = {
+  login: string
+  repos: RepoChoice[]
+}
+
+export type RepoList = {
+  owners: RepoOwner[]
+  available: boolean
+  error?: string | null
+}

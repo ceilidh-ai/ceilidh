@@ -320,6 +320,43 @@ pub struct ModelChoice {
     pub label: String,
 }
 
+/// One repository the operator can start a session in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoChoice {
+    /// `owner/name`.
+    pub full_name: String,
+    pub owner: String,
+    pub name: String,
+    #[serde(default)]
+    pub private: bool,
+    /// Clone URL the session profile takes.
+    pub url: String,
+    /// Last push, so the list can lead with what is being worked on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoList {
+    /// Owners (the user's account and every org they belong to), each with
+    /// their repositories, most recently pushed first.
+    #[serde(default)]
+    pub owners: Vec<RepoOwner>,
+    /// Absent when the caller has no GitHub token configured; the client
+    /// falls back to a free-text repository field.
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoOwner {
+    pub login: String,
+    #[serde(default)]
+    pub repos: Vec<RepoChoice>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerConfig {
     /// Prefilled into the new-session form; None = scratch workspace.
