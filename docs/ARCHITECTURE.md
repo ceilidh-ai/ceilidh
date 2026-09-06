@@ -14,7 +14,7 @@ The walking skeleton: one binary, three roles, one contract.
                     |
                     | shell-out
                     v
-                harness CLIs (claude-code, codex; the band)
+         harness CLIs (claude-code, codex, cursor; the band)
 ```
 
 ## The flow of one turn
@@ -68,9 +68,40 @@ The walking skeleton: one binary, three roles, one contract.
 - **Explicit routing:** an unknown lane or harness is a 422 with the menu,
   never a silent fallback.
 
-## What phase 1 deliberately leaves out
+## Sub-agents
 
-Sub-agent spawn (dispatch), multi-step factory runs, the envelope renderer UX
-(progressive disclosure, forms), codex and gemini adapters, secrets vault,
-multi-tenancy, Postgres. The protocol leaves room for each; the skeleton
-builds none.
+Every harness invocation gets a stdio MCP server, `ceilidh mcp`, spawned by the
+runner with the caller's URL and a parent session id. It exposes
+`spawn_subagent` (create a child session with `parent_id`, run one turn, return
+its answer), `list_sessions`, and `read_session`. Children are ordinary
+sessions: their own lane, their own workspace, their own branch, visible under
+their parent in the UI and continuable on their own. A parent can spawn several
+at once, of different vendors, by making several tool calls in one message.
+
+The tool description is generated from `GET /api/config` at startup, so it
+names the lanes this installation actually has. That is not cosmetic: a harness
+asked to pass through a model name it has never heard of will otherwise refuse
+the call as fabricated.
+
+## Cancel
+
+A cancel on a queued turn finishes it immediately. On a turn a runner already
+holds, the caller records the request; the runner polls
+`GET /api/runner/turns/{id}/control` while it works, kills the harness, and
+reports `cancelled`.
+
+## Runner identity
+
+A runner is identified by a stable id (`<host>:<user>` by convention) plus a
+random per-process epoch. The id carries workspace affinity across restarts;
+the epoch tells the caller which process is current. A heartbeat lists the
+turns its process holds, and the caller releases anything assigned to that
+runner and missing from the list, which is how a crashed and restarted runner
+gets its abandoned turns back rather than wedging the session. A heartbeat from
+a stale epoch (an orphan process left behind by a redeploy) reconciles nothing.
+
+## What is still deliberately out
+
+Multi-step factory runs, the envelope renderer UX (progressive disclosure,
+forms), a secrets vault, multi-tenancy, Postgres. The protocol leaves room for
+each; the skeleton builds none.

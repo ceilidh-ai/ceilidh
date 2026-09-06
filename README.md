@@ -38,6 +38,23 @@ web/                      React web app (built into the binary)
 
 Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Deploy
+
+The caller runs anywhere that can serve HTTP; the runners run wherever your
+harness logins live.
+
+- **Caller:** the `Dockerfile` builds the binary with the web client baked in,
+  serves on `$PORT`, and keeps SQLite on a mounted volume
+  (`CEILIDH_DB`, default `/data/ceilidh.db`). Set `CEILIDH_TOKEN` and
+  optionally `CEILIDH_DEFAULT_REPO`.
+- **Runners on macOS:** `deploy/launchd/install-runner.sh <user> <binary>
+  <runner.env>` installs one LaunchDaemon per seat user, unlocking that user's
+  login keychain so the harness CLIs can read their subscription credentials.
+  `uninstall-runner.sh <user>` is the exact undo. Details in
+  [deploy/launchd/README.md](deploy/launchd/README.md).
+- **Check it:** `scripts/vendor-smoke.sh` creates one session per vendor
+  through the API and asserts a non-empty first reply.
+
 ## Dev
 
 ```
