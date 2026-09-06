@@ -25,6 +25,9 @@ const DEFAULT_WAIT_MINUTES: u64 = 20;
 const MAX_WAIT_MINUTES: u64 = 20;
 const POLL_SECONDS: u64 = 2;
 const REPLY_CAP_CHARS: usize = 12_000;
+/// A parent that spawns more waiting children than the fleet has slots would
+/// deadlock until the waits time out.
+const MAX_CONCURRENT_SPAWNS: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct McpOptions {
@@ -62,7 +65,19 @@ pub async fn run(opts: McpOptions) -> Result<()> {
         let message: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(err) => {
+                // A silent drop leaves the harness waiting out its whole tool
+                // timeout, so answer with the parse error JSON-RPC defines.
                 warn!(error = %err, "unparsable jsonrpc line");
+                let mut out = stdout.lock().await;
+                let mut bytes = serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": format!("parse error: {err}") }
+                }))
+                .unwrap_or_default();
+                bytes.push(b'\n');
+                let _ = out.write_all(&bytes).await;
+                let _ = out.flush().await;
                 continue;
             }
         };
@@ -134,10 +149,9 @@ async fn handle(
 ) -> Result<Value, RpcError> {
     match method {
         "initialize" => Ok(json!({
-            "protocolVersion": params
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(PROTOCOL_VERSION),
+            // The version this server actually speaks, never the client's
+            // proposal echoed back.
+            "protocolVersion": PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "ceilidh", "version": env!("CARGO_PKG_VERSION") }
         })),
@@ -272,6 +286,7 @@ struct Caller {
     server_url: String,
     token: Option<String>,
     parent: SessionId,
+    spawn_slots: tokio::sync::Semaphore,
 }
 
 impl Caller {
@@ -284,6 +299,7 @@ impl Caller {
             server_url: opts.server_url.trim_end_matches('/').to_string(),
             token: opts.token,
             parent: opts.parent,
+            spawn_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_SPAWNS),
         })
     }
 
@@ -321,6 +337,11 @@ impl Caller {
     }
 
     async fn spawn_subagent(&self, args: Value) -> Result<String> {
+        let _slot = self
+            .spawn_slots
+            .acquire()
+            .await
+            .context("sub-agent slots closed")?;
         let harness = parse_harness(
             args.get("harness")
                 .and_then(Value::as_str)
@@ -379,7 +400,11 @@ impl Caller {
             profile: Some(SessionProfile {
                 repo_url: repo,
                 base_branch: parent.profile.base_branch.clone(),
-                allow_push: parent.profile.allow_push,
+                // A child's repository can be chosen by the model, so pushing
+                // with the seat's git credentials is never inherited: the work
+                // is committed in the child's own workspace and read from
+                // there.
+                allow_push: false,
             }),
             parent_id: Some(self.parent),
         };
@@ -447,9 +472,36 @@ impl Caller {
         }
     }
 
-    async fn list_sessions(&self) -> Result<String> {
+    /// This session plus everything descended from it. Other sessions belong
+    /// to other work and are not this harness's to read.
+    async fn family(&self) -> Result<Vec<Session>> {
         let sessions: Vec<Session> = self.get_json("/api/sessions").await?;
-        let rows = sessions
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert(self.parent);
+        // Children can nest, so walk until the set stops growing.
+        loop {
+            let before = allowed.len();
+            for session in &sessions {
+                if let Some(parent) = session.parent_id {
+                    if allowed.contains(&parent) {
+                        allowed.insert(session.id);
+                    }
+                }
+            }
+            if allowed.len() == before {
+                break;
+            }
+        }
+        Ok(sessions
+            .into_iter()
+            .filter(|s| allowed.contains(&s.id))
+            .collect())
+    }
+
+    async fn list_sessions(&self) -> Result<String> {
+        let rows = self
+            .family()
+            .await?
             .iter()
             .map(|s| {
                 json!({
@@ -459,7 +511,7 @@ impl Caller {
                     "model": s.lane.model,
                     "status": s.status,
                     "parent_id": s.parent_id,
-                    "is_child_of_you": s.parent_id == Some(self.parent),
+                    "is_you": s.id == self.parent,
                 })
             })
             .collect::<Vec<_>>();
@@ -472,7 +524,14 @@ impl Caller {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("session_id is required"))?;
         let id: SessionId = id.parse().context("session_id must be a uuid")?;
-        let session: Session = self.get_json(&format!("/api/sessions/{id}")).await?;
+        let session = self
+            .family()
+            .await?
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| {
+                anyhow!("session {id} is not this session or one of its sub-agents")
+            })?;
         let turns: Vec<Turn> = self.get_json(&format!("/api/sessions/{id}/turns")).await?;
         let mut out = format!(
             "session {} ({}) on {} {} status {:?}\n",
@@ -513,7 +572,6 @@ fn parse_harness(value: &str) -> Result<Harness> {
         "claude-code" | "claude" | "anthropic" => Ok(Harness::ClaudeCode),
         "codex" | "openai" => Ok(Harness::Codex),
         "cursor" => Ok(Harness::Cursor),
-        "mock" => Ok(Harness::Mock),
         other => Err(anyhow!(
             "unknown harness {other:?}; use claude-code, codex, or cursor"
         )),
@@ -605,5 +663,33 @@ mod tests {
         assert_eq!(parse_harness("openai").unwrap(), Harness::Codex);
         assert_eq!(parse_harness("cursor").unwrap(), Harness::Cursor);
         assert!(parse_harness("gemini").is_err());
+        // The echo harness exists for tests; a model must not be able to
+        // spawn a child that returns its own prompt as finished work.
+        assert!(parse_harness("mock").is_err());
+    }
+
+    #[test]
+    fn initialize_states_the_version_this_server_speaks() {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let caller = Caller::new(McpOptions {
+                    server_url: "http://127.0.0.1:1".into(),
+                    token: None,
+                    parent: uuid::Uuid::nil(),
+                })
+                .unwrap();
+                handle(
+                    &caller,
+                    &tool_definitions(&[]),
+                    "initialize",
+                    json!({ "protocolVersion": "1999-01-01" }),
+                )
+                .await
+                .map_err(|e| e.message)
+            })
+            .unwrap();
+        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
     }
 }

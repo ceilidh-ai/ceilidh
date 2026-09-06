@@ -22,6 +22,8 @@ use crate::{AdapterOutcome, ChunkSink};
 
 pub(crate) const TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STDERR_TAIL_CHARS: usize = 2000;
+/// Hard ceiling on captured stderr. Only the tail is reported.
+const STDERR_CAPTURE_LIMIT: u64 = 256 * 1024;
 /// MCP tool calls include a synchronous sub-agent turn, so the harness must
 /// wait far longer than its default tool timeout.
 const MCP_TOOL_TIMEOUT_SECS: u64 = 25 * 60;
@@ -68,6 +70,7 @@ impl TurnCtx<'_> {
         }
     }
 
+        /// True for the one harness that needs the Cursor key in its environment.
     fn mcp_args(&self) -> Vec<String> {
         vec![
             "mcp".to_string(),
@@ -251,7 +254,8 @@ async fn cursor(ctx: TurnCtx<'_>) -> Result<AdapterOutcome> {
             }
         }
     });
-    write_private(&cursor_dir.join("mcp.json"), &serde_json::to_vec_pretty(&mcp)?).await?;
+    let mcp_path = cursor_dir.join("mcp.json");
+    write_private(&mcp_path, &serde_json::to_vec_pretty(&mcp)?).await?;
     exclude_from_git(ctx.workspace_dir, ".cursor/mcp.json").await?;
 
     let mut command = Command::new(&ctx.harness.cursor_bin);
@@ -270,7 +274,39 @@ async fn cursor(ctx: TurnCtx<'_>) -> Result<AdapterOutcome> {
     command.arg(ctx.prompt());
 
     let mut parser = CursorStream::default();
-    run_streaming(command, &mut parser, &ctx, "cursor").await
+    let outcome = run_streaming(command, &mut parser, &ctx, "cursor").await;
+
+    // The config carries the caller token and lives inside the repository the
+    // turn is about to commit. `.git/info/exclude` covers an untrusted file,
+    // but not a repository that already tracks that path, so the file goes
+    // away before the commit either way and a tracked one is restored.
+    let _ = fs::remove_file(&mcp_path).await;
+    let _ = restore_if_tracked(ctx.workspace_dir, ".cursor/mcp.json").await;
+    outcome
+}
+
+/// Puts a path back the way the repository has it, if the repository tracks it
+/// at all. Used after a harness config has been removed from a workspace.
+async fn restore_if_tracked(workspace_dir: &Path, path: &str) -> Result<()> {
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", path])
+        .current_dir(workspace_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    if tracked.success() {
+        Command::new("git")
+            .args(["checkout", "--", path])
+            .current_dir(workspace_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +337,20 @@ async fn run_streaming(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // A harness runs with permission prompts off, so anything in its
+        // environment is readable by the model. The MCP child gets the caller
+        // token through its own config block; the harness itself never needs
+        // it.
+        .env_remove("CEILIDH_TOKEN")
+        .env_remove("CEILIDH_SERVER")
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // The harness spawns the MCP server as a grandchild. Its own process
+        // group means a cancel or a timeout can take the whole tree down
+        // instead of orphaning a process that still holds a turn open.
+        command.process_group(0);
+    }
 
     info!(label, model = ctx.model, seq = ctx.seq, "spawning harness");
     let mut child = command
@@ -316,12 +365,15 @@ async fn run_streaming(
         .take()
         .ok_or_else(|| anyhow!("{label} stderr was not piped"))?;
 
+    // A hostile or merely noisy CLI must not be able to grow the runner's
+    // memory without bound; only the tail is ever reported anyway.
     let stderr_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
+        let mut reader = BufReader::new(stderr).take(STDERR_CAPTURE_LIMIT);
         let mut stderr = String::new();
         reader.read_to_string(&mut stderr).await.map(|_| stderr)
     });
 
+    let child_pid = child.id();
     let mut lines = BufReader::new(stdout).lines();
     let timeout = time::sleep(TURN_TIMEOUT);
     tokio::pin!(timeout);
@@ -367,14 +419,14 @@ async fn run_streaming(
     // value would disable it outright, so check the value first and then wait
     // for a change.
     if *cancel.borrow() {
-        let _ = child.kill().await;
+        kill_tree(&mut child, child_pid).await;
         let _ = join_stderr(stderr_task).await;
         return Ok(AdapterOutcome::cancelled(parser.resume_token()));
     }
 
     let status = tokio::select! {
         _ = &mut timeout => {
-            let _ = child.kill().await;
+            kill_tree(&mut child, child_pid).await;
             let stderr = join_stderr(stderr_task).await;
             return Ok(AdapterOutcome::error(
                 format!("{label} timed out after 30 minutes: {}", joinable_tail(&stderr, label)),
@@ -383,7 +435,7 @@ async fn run_streaming(
         }
         changed = cancel.changed() => {
             let _ = changed;
-            let _ = child.kill().await;
+            kill_tree(&mut child, child_pid).await;
             let _ = join_stderr(stderr_task).await;
             return Ok(AdapterOutcome::cancelled(parser.resume_token()));
         }
@@ -413,6 +465,22 @@ async fn run_streaming(
     }
 
     let reply = parser.reply_text();
+    if reply.trim().is_empty() {
+        let message = format!(
+            "{label} exited cleanly without producing a reply: {}",
+            joinable_tail(&stderr, label)
+        );
+        if parser.capped_hint() {
+            return Ok(AdapterOutcome::capped(message, resume_token));
+        }
+        return Ok(AdapterOutcome::error(message, resume_token));
+    }
+    if parser.capped_hint() {
+        return Ok(AdapterOutcome::capped(
+            format!("{label} reported its plan limit was reached mid-turn"),
+            resume_token,
+        ));
+    }
     let envelope = Envelope {
         headline: headline_from_reply(&reply, label),
         work_complete: true,
@@ -839,6 +907,24 @@ fn headline_from_reply(reply: &str, label: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or(&fallback);
     truncate_chars(headline, 120)
+}
+
+/// SIGKILLs the harness and anything it spawned. The harness runs in its own
+/// process group, so a negative pid reaches the MCP server too; killing only
+/// the harness would leave that grandchild holding a sub-agent turn open.
+async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let _ = Command::new("/bin/kill")
+            .arg("-9")
+            .arg(format!("-{pid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.kill().await;
 }
 
 async fn join_stderr(task: tokio::task::JoinHandle<std::io::Result<String>>) -> String {
