@@ -45,6 +45,9 @@ pub struct HarnessConfig {
 
 pub(crate) struct TurnCtx<'a> {
     pub workspace_dir: &'a Path,
+    /// Human title of the session, and the branch its workspace sits on.
+    pub session_title: &'a str,
+    pub session_branch: &'a str,
     /// The session directory above the workspace; harness config files that
     /// must never be committed live here.
     pub session_dir: &'a Path,
@@ -343,6 +346,13 @@ async fn run_streaming(
         // it.
         .env_remove("CEILIDH_TOKEN")
         .env_remove("CEILIDH_SERVER")
+        // Identity, though, is exactly what a session needs: tooling in the
+        // workspace has no other way to tell one session from another, since
+        // every workspace is a directory called `ws`.
+        .env("CEILIDH_SESSION_ID", ctx.session_id.to_string())
+        .env("CEILIDH_SESSION_TITLE", ctx.session_title)
+        .env("CEILIDH_SESSION_BRANCH", ctx.session_branch)
+        .env("CEILIDH_TURN", ctx.seq.to_string())
         .kill_on_drop(true);
     #[cfg(unix)]
     {
@@ -1102,6 +1112,8 @@ mod tests {
         let sd = PathBuf::from("/Users/seat");
         let ctx = TurnCtx {
             workspace_dir: &ws,
+            session_title: "test session",
+            session_branch: "ceilidh/test-session-00000000",
             session_dir: &sd,
             session_id: uuid::Uuid::nil(),
             seq: 1,

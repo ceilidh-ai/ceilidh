@@ -177,6 +177,8 @@ async fn execute_work(
     let (cancel_rx, cancel_task) = spawn_cancel_watcher(api, work.turn.id);
     let ctx = TurnCtx {
         workspace_dir: workspace.path(),
+        session_title: &work.session.title,
+        session_branch: workspace.branch(),
         session_dir: workspace.session_dir(),
         session_id: work.session.id,
         seq: work.turn.seq,
@@ -578,6 +580,10 @@ impl Workspace {
 
     fn session_dir(&self) -> &Path {
         &self.session_dir
+    }
+
+    fn branch(&self) -> &str {
+        &self.branch
     }
 
     async fn commit_turn(&self, seq: i64) -> Result<String> {

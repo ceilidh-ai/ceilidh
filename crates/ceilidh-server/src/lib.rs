@@ -47,6 +47,8 @@ const HELD_TURN_GRACE_SECS: i64 = 90;
 const CLAIM_WAIT_CAP_SECS: u32 = 30;
 const SSE_KEEP_ALIVE_SECS: u64 = 15;
 const HISTORY_HINT_LIMIT: i64 = 8;
+/// How many messages may wait behind a running turn.
+const MAX_QUEUED_TURNS_PER_SESSION: i64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
@@ -435,26 +437,29 @@ async fn post_turn(
         return Err(ApiError::not_found("session"));
     }
 
-    let in_flight: i64 = sqlx::query(
+    // A turn already running does not block the next message. Turns still
+    // execute one at a time (the claim query enforces that, because the
+    // session workspace is a single directory), so a message sent mid-turn
+    // queues and runs next: the way you steer an agent that is already
+    // working. The cap stops a runaway client filling the queue.
+    let waiting: i64 = sqlx::query(
         r#"
         SELECT COUNT(*) AS count
         FROM turns
         WHERE session_id = ?
-          AND status IN (?, ?, ?)
+          AND status = ?
         "#,
     )
     .bind(session_id.to_string())
     .bind(enum_string(&TurnStatus::Queued)?)
-    .bind(enum_string(&TurnStatus::Claimed)?)
-    .bind(enum_string(&TurnStatus::Working)?)
     .fetch_one(&mut *tx)
     .await?
     .try_get("count")?;
 
-    if in_flight > 0 {
-        return Err(ApiError::conflict(
-            "session already has an in-flight turn",
-        ));
+    if waiting >= MAX_QUEUED_TURNS_PER_SESSION {
+        return Err(ApiError::conflict(format!(
+            "this session already has {waiting} messages waiting; let it catch up first"
+        )));
     }
 
     let prior_max: Option<i64> = sqlx::query(

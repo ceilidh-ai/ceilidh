@@ -859,7 +859,10 @@ function ChatView({
   const bottom = useRef<HTMLDivElement | null>(null)
   const inFlightTurn = turns.find((turn) => inFlightStatuses.has(turn.status))
   const now = useNow(inFlightTurn ? 1_000 : 60_000)
-  const disabled = sending || inFlightTurn !== undefined
+  const queuedAhead = turns.filter((turn) => turn.status === 'queued').length
+  // Typing at a working agent is how you steer it: the message queues and
+  // runs next, so the composer never locks.
+  const disabled = sending
   const repo = shortRepo(session.profile.repo_url)
   const liveLength = turns.reduce(
     (total, turn) => total + (liveChunks[turn.id]?.length ?? 0),
@@ -1018,10 +1021,20 @@ function ChatView({
             onChange={(event) => setInput(event.target.value)}
             onKeyDown={keyDown}
             placeholder={
-              inFlightTurn ? 'Turn in flight' : 'Message for the next turn'
+              inFlightTurn
+                ? 'Steer it: this runs as the next turn'
+                : 'Message for the next turn'
             }
             value={input}
           />
+
+          {queuedAhead > 0 ? (
+            <p className="mt-2 text-xs text-slate-400">
+              {queuedAhead === 1
+                ? '1 message waiting to run next'
+                : `${queuedAhead} messages waiting, in order`}
+            </p>
+          ) : null}
 
           <div className="mt-2 flex items-center justify-end gap-2">
             {inFlightTurn ? (
@@ -1041,7 +1054,7 @@ function ChatView({
               type="submit"
             >
               {sending ? <span className="spinner dark" /> : null}
-              Send
+              {inFlightTurn ? 'Queue' : 'Send'}
             </button>
           </div>
         </div>

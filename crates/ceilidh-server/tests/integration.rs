@@ -998,3 +998,126 @@ async fn a_session_never_has_two_turns_claimed_at_once() -> Result<()> {
     let _ = first;
     Ok(())
 }
+
+
+/// You must be able to type at an agent that is already working: the message
+/// queues and runs next, in order, one at a time.
+#[tokio::test]
+async fn messages_queue_behind_a_running_turn() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-steer-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: None,
+        default_repo_url: None,
+    })
+    .await?;
+
+    let session: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "steering".to_string(),
+            lane: Some(Lane {
+                harness: Harness::Mock,
+                model: "mock".to_string(),
+                effort: None,
+            }),
+            profile: None,
+            parent_id: None,
+        },
+    )
+    .await?;
+
+    let first: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &PostTurnRequest {
+            input: "start the long thing".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    let claimed: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "runner-a".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+            epoch: Some("a".to_string()),
+        },
+    )
+    .await?;
+    assert!(matches!(claimed, ClaimResponse::Work { .. }));
+
+    // The steer, typed while the first turn is still running.
+    let second: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &PostTurnRequest {
+            input: "actually, do it the other way".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+    assert_eq!(second.seq, 2);
+    assert_eq!(second.status, TurnStatus::Queued);
+
+    // It waits its turn rather than running beside the first.
+    let while_busy: ClaimResponse = send_json(
+        &app,
+        Method::POST,
+        "/api/runner/claim",
+        None,
+        &ClaimRequest {
+            runner: "runner-b".to_string(),
+            harnesses: vec![Harness::Mock],
+            wait_seconds: 0,
+            epoch: Some("b".to_string()),
+        },
+    )
+    .await?;
+    assert!(matches!(while_busy, ClaimResponse::Empty));
+
+    // The queue has a ceiling.
+    for _ in 0..4 {
+        let _: Turn = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/sessions/{}/turns", session.id),
+            None,
+            &PostTurnRequest {
+                input: "more".to_string(),
+                lane: None,
+            },
+        )
+        .await?;
+    }
+    let over = send_status(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", session.id),
+        None,
+        &PostTurnRequest {
+            input: "too much".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+    assert_eq!(over, StatusCode::CONFLICT);
+
+    let _ = first;
+    Ok(())
+}
