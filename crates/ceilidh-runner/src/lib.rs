@@ -58,6 +58,9 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
         .with_context(|| format!("create runner data dir {}", opts.data_dir.display()))?;
 
     let runner_id = opts.runner_id.unwrap_or_else(default_runner_id);
+    // One id per process, so the caller can tell this process from an orphan
+    // that survived a redeploy under the same runner id.
+    let epoch = uuid::Uuid::new_v4().to_string();
     let api = RunnerApi::new(opts.server_url, opts.token)?;
     let active_turns = Arc::new(RwLock::new(HashSet::new()));
     let max_turns = opts.max_turns.max(1);
@@ -66,6 +69,7 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
 
     info!(
         runner = %runner_id,
+        epoch = %epoch,
         data_dir = %opts.data_dir.display(),
         harnesses = ?opts.harnesses,
         max_turns,
@@ -75,6 +79,7 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
     tokio::spawn(heartbeat_loop(
         api.clone(),
         runner_id.clone(),
+        epoch.clone(),
         active_turns.clone(),
     ));
 
@@ -94,6 +99,7 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
             runner: runner_id.clone(),
             harnesses: opts.harnesses.clone(),
             wait_seconds: CLAIM_WAIT_SECONDS,
+            epoch: Some(epoch.clone()),
         };
 
         match api.claim(&request).await {
@@ -361,6 +367,7 @@ async fn expect_success(response: reqwest::Response, label: &str) -> Result<reqw
 async fn heartbeat_loop(
     api: RunnerApi,
     runner_id: String,
+    epoch: String,
     active_turns: Arc<RwLock<HashSet<TurnId>>>,
 ) {
     let mut interval = time::interval(Duration::from_secs(HEARTBEAT_SECONDS));
@@ -376,6 +383,7 @@ async fn heartbeat_loop(
             runner: runner_id.clone(),
             active_turns,
             at: Utc::now(),
+            epoch: Some(epoch.clone()),
         };
         if let Err(err) = api.heartbeat(&heartbeat).await {
             warn!(error = %err, "runner heartbeat failed");

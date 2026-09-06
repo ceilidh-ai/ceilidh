@@ -362,6 +362,16 @@ async fn run_streaming(
         }
     }
 
+    // A cancel that landed between the stream closing and this point would be
+    // invisible to `changed()` alone, and guarding the branch on the current
+    // value would disable it outright, so check the value first and then wait
+    // for a change.
+    if *cancel.borrow() {
+        let _ = child.kill().await;
+        let _ = join_stderr(stderr_task).await;
+        return Ok(AdapterOutcome::cancelled(parser.resume_token()));
+    }
+
     let status = tokio::select! {
         _ = &mut timeout => {
             let _ = child.kill().await;
@@ -371,7 +381,7 @@ async fn run_streaming(
                 parser.resume_token(),
             ));
         }
-        changed = cancel.changed(), if !*cancel.borrow() => {
+        changed = cancel.changed() => {
             let _ = changed;
             let _ = child.kill().await;
             let _ = join_stderr(stderr_task).await;

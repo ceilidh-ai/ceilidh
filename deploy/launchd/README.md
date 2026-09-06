@@ -39,6 +39,12 @@ group), the keychain password at `~/.nova-kc-pw` (0600), `claude` / `codex`
 / `cursor-agent` on `/opt/homebrew/bin`, and `gh auth login` for git over
 https. Override the key or password paths with `LOOP_KEY=` / `KC_PW_FILE=`.
 
+Reinstalling is safe to repeat: `launchctl bootout` only kills the local ssh
+client, so the installer also reaps any runner process still alive under that
+user before bootstrapping the new one. Two processes sharing a runner id would
+both claim turns, and the caller's epoch check would see one of them as a
+zombie.
+
 Codex runs from a per-session `CODEX_HOME` whose `auth.json` is a symlink to
 the seat's `~/.codex/auth.json` (override with `CEILIDH_CODEX_AUTH`), so the
 seat's global Codex config (plugins, trusted projects) never leaks into a
