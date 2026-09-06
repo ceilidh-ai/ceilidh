@@ -252,12 +252,28 @@ name = "ceilidh-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ceilidh-mcp",
  "ceilidh-protocol",
  "ceilidh-runner",
  "ceilidh-server",
  "clap",
  "tokio",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ceilidh-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ceilidh-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

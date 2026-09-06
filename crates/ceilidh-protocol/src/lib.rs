@@ -30,6 +30,7 @@ pub type RunnerId = String;
 pub enum Harness {
     ClaudeCode,
     Codex,
+    Cursor,
     Mock,
 }
 
@@ -94,6 +95,9 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_affinity: Option<RunnerId>,
     pub status: SessionStatus,
+    /// Set when this session was spawned as a sub-agent of another session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<SessionId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -112,6 +116,8 @@ pub enum TurnStatus {
     Error,
     /// The lane's plan is capped; the turn may be retried on reset or rerouted.
     Capped,
+    /// The human cancelled the turn (before or during execution).
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +143,10 @@ pub struct Turn {
     /// the harness conversation instead of reseeding from history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_token: Option<String>,
+    /// True once a cancel has been asked for but the runner has not yet
+    /// reported the turn as cancelled.
+    #[serde(default)]
+    pub cancel_requested: bool,
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
@@ -185,6 +195,9 @@ pub enum Event {
     TurnDone { turn: Turn },
     TurnError { turn_id: TurnId, message: String },
     RunnerStatus { runner: RunnerStatusInfo },
+    TurnCancelled { turn: Turn },
+    /// A session appeared (created by a human or spawned as a sub-agent).
+    SessionCreated { session: Session },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,7 +252,7 @@ pub enum ClaimResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportRequest {
-    /// Done, Error, or Capped.
+    /// Done, Error, Capped, or Cancelled.
     pub status: TurnStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<Envelope>,
@@ -249,6 +262,13 @@ pub struct ReportRequest {
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_token: Option<String>,
+}
+
+/// What the caller tells a runner about an in-flight turn it holds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TurnControl {
+    #[serde(default)]
+    pub cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,6 +290,34 @@ pub struct CreateSessionRequest {
     pub lane: Option<Lane>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<SessionProfile>,
+    /// Spawn this session as a child of an existing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<SessionId>,
+}
+
+// ---------------------------------------------------------------------------
+// Config: what the caller offers the client (model menu, defaults).
+// ---------------------------------------------------------------------------
+
+/// One row of the model menu the UI offers, grouped by vendor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// Display group, e.g. "Anthropic", "OpenAI", "Cursor".
+    pub vendor: String,
+    pub harness: Harness,
+    /// The exact model string the harness CLI takes.
+    pub model: String,
+    /// Human label for the picker.
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerConfig {
+    /// Prefilled into the new-session form; None = scratch workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_repo_url: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelChoice>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -290,6 +338,14 @@ mod tests {
         assert!(json.contains("claude-code"));
         let back: Lane = serde_json::from_str(&json).unwrap();
         assert_eq!(lane, back);
+    }
+
+    #[test]
+    fn cursor_harness_is_kebab_case() {
+        let json = serde_json::to_string(&Harness::Cursor).unwrap();
+        assert_eq!(json, r#""cursor""#);
+        let back: Harness = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Harness::Cursor);
     }
 
     #[test]

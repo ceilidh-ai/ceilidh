@@ -2,6 +2,8 @@
 //!
 //! Owned by lane/runner. The public entry-point signature is fixed by the CLI.
 
+mod adapters;
+
 use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -9,29 +11,29 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use ceilidh_protocol::{
     ClaimRequest, ClaimResponse, ClaimedWork, Envelope, Harness, Heartbeat, ReportRequest, Session,
-    SessionId, TurnId, TurnStatus, TurnSummary,
+    TurnControl, TurnId, TurnStatus,
 };
 use chrono::Utc;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Client, Method};
 use serde::Serialize;
-use serde_json::Value;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc, watch};
 use tokio::time;
 use tracing::{debug, info, warn};
+
+pub use adapters::HarnessConfig;
+use adapters::{TurnCtx, tail_chars};
 
 const CLAIM_WAIT_SECONDS: u32 = 30;
 const CLAIM_TIMEOUT_SECONDS: u64 = 45;
 const HEARTBEAT_SECONDS: u64 = 30;
+const CANCEL_POLL_SECONDS: u64 = 2;
 const MIN_BACKOFF_SECONDS: u64 = 2;
 const MAX_BACKOFF_SECONDS: u64 = 30;
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const STDERR_TAIL_CHARS: usize = 2000;
 
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
@@ -44,6 +46,10 @@ pub struct RunnerOptions {
     pub data_dir: PathBuf,
     /// Which harnesses this runner offers.
     pub harnesses: Vec<Harness>,
+    /// How many turns this runner plays at once.
+    pub max_turns: usize,
+    /// Harness binaries and the sub-agent MCP wiring.
+    pub harness: HarnessConfig,
 }
 
 pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
@@ -54,11 +60,15 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
     let runner_id = opts.runner_id.unwrap_or_else(default_runner_id);
     let api = RunnerApi::new(opts.server_url, opts.token)?;
     let active_turns = Arc::new(RwLock::new(HashSet::new()));
+    let max_turns = opts.max_turns.max(1);
+    let slots = Arc::new(Semaphore::new(max_turns));
+    let harness = Arc::new(opts.harness);
 
     info!(
         runner = %runner_id,
         data_dir = %opts.data_dir.display(),
         harnesses = ?opts.harnesses,
+        max_turns,
         "ceilidh runner starting"
     );
 
@@ -68,10 +78,18 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
         active_turns.clone(),
     ));
 
-    let workspace_manager = WorkspaceManager::new(opts.data_dir);
+    let workspace_manager = Arc::new(WorkspaceManager::new(opts.data_dir));
     let mut backoff = Duration::from_secs(MIN_BACKOFF_SECONDS);
 
     loop {
+        // Hold a slot before asking for work, so a full runner stops claiming
+        // instead of queueing turns it cannot start.
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("runner slot semaphore closed")?;
+
         let request = ClaimRequest {
             runner: runner_id.clone(),
             harnesses: opts.harnesses.clone(),
@@ -80,16 +98,25 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
 
         match api.claim(&request).await {
             Ok(ClaimResponse::Empty) => {
+                drop(permit);
                 backoff = Duration::from_secs(MIN_BACKOFF_SECONDS);
             }
             Ok(ClaimResponse::Work { work }) => {
                 backoff = Duration::from_secs(MIN_BACKOFF_SECONDS);
                 let turn_id = work.turn.id;
                 active_turns.write().await.insert(turn_id);
-                process_work(api.clone(), &workspace_manager, work).await;
-                active_turns.write().await.remove(&turn_id);
+                let api = api.clone();
+                let workspace_manager = workspace_manager.clone();
+                let active_turns = active_turns.clone();
+                let harness = harness.clone();
+                tokio::spawn(async move {
+                    process_work(api, &workspace_manager, &harness, work).await;
+                    active_turns.write().await.remove(&turn_id);
+                    drop(permit);
+                });
             }
             Err(err) => {
+                drop(permit);
                 warn!(
                     error = %err,
                     sleep_seconds = backoff.as_secs(),
@@ -102,9 +129,14 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
     }
 }
 
-async fn process_work(api: RunnerApi, workspace_manager: &WorkspaceManager, work: ClaimedWork) {
+async fn process_work(
+    api: RunnerApi,
+    workspace_manager: &WorkspaceManager,
+    harness: &HarnessConfig,
+    work: ClaimedWork,
+) {
     let turn_id = work.turn.id;
-    let report = execute_work(api.clone(), workspace_manager, work)
+    let report = execute_work(api.clone(), workspace_manager, harness, work)
         .await
         .unwrap_or_else(|err| ReportRequest {
             status: TurnStatus::Error,
@@ -122,6 +154,7 @@ async fn process_work(api: RunnerApi, workspace_manager: &WorkspaceManager, work
 async fn execute_work(
     api: RunnerApi,
     workspace_manager: &WorkspaceManager,
+    harness: &HarnessConfig,
     work: ClaimedWork,
 ) -> Result<ReportRequest> {
     let workspace = workspace_manager
@@ -134,9 +167,11 @@ async fn execute_work(
         .as_ref()
         .unwrap_or(&work.session.lane);
 
-    let (chunk_sink, chunk_task) = spawn_chunk_poster(api, work.turn.id);
+    let (chunk_sink, chunk_task) = spawn_chunk_poster(api.clone(), work.turn.id);
+    let (cancel_rx, cancel_task) = spawn_cancel_watcher(api, work.turn.id);
     let ctx = TurnCtx {
         workspace_dir: workspace.path(),
+        session_dir: workspace.session_dir(),
         session_id: work.session.id,
         seq: work.turn.seq,
         input: &work.turn.input,
@@ -145,9 +180,12 @@ async fn execute_work(
         resume_token: work.turn.resume_token.as_deref(),
         history_hint: &work.history_hint,
         chunk_sink: chunk_sink.clone(),
+        cancel: cancel_rx,
+        harness,
     };
 
-    let adapter_result = execute_adapter(lane.harness, ctx).await;
+    let adapter_result = adapters::execute(lane.harness, ctx).await;
+    cancel_task.abort();
     drop(chunk_sink);
     if let Err(err) = chunk_task.await {
         warn!(turn_id = %work.turn.id, error = %err, "chunk poster task failed");
@@ -196,15 +234,27 @@ async fn execute_work(
     Ok(outcome.into_report(commit))
 }
 
-async fn execute_adapter(harness: Harness, ctx: TurnCtx<'_>) -> Result<AdapterOutcome> {
-    match harness {
-        Harness::Mock => MockAdapter.execute(ctx).await,
-        Harness::ClaudeCode => ClaudeCodeAdapter.execute(ctx).await,
-        Harness::Codex => Ok(AdapterOutcome::error(
-            "codex harness is not implemented by ceilidh-runner v0",
-            None,
-        )),
-    }
+/// Polls the caller while a turn runs; flips the watch when a cancel lands.
+fn spawn_cancel_watcher(
+    api: RunnerApi,
+    turn_id: TurnId,
+) -> (watch::Receiver<bool>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = watch::channel(false);
+    let handle = tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(CANCEL_POLL_SECONDS));
+        loop {
+            interval.tick().await;
+            match api.control(turn_id).await {
+                Ok(control) if control.cancel_requested => {
+                    let _ = tx.send(true);
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => debug!(turn_id = %turn_id, error = %err, "cancel poll failed"),
+            }
+        }
+    });
+    (rx, handle)
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +313,20 @@ impl RunnerApi {
         let response = self.send_json(Method::POST, &path, report).await?;
         expect_success(response, "report").await?;
         Ok(())
+    }
+
+    async fn control(&self, turn_id: TurnId) -> Result<TurnControl> {
+        let url = format!("{}/api/runner/turns/{turn_id}/control", self.server_url);
+        let mut request = self.client.get(url);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.context("send control poll")?;
+        let response = expect_success(response, "control").await?;
+        response
+            .json::<TurnControl>()
+            .await
+            .context("decode control response")
     }
 
     async fn send_json<T: Serialize + ?Sized>(
@@ -335,37 +399,22 @@ fn spawn_chunk_poster(api: RunnerApi, turn_id: TurnId) -> (ChunkSink, tokio::tas
 }
 
 #[derive(Clone)]
-struct ChunkSink {
-    tx: mpsc::UnboundedSender<String>,
+pub(crate) struct ChunkSink {
+    pub(crate) tx: mpsc::UnboundedSender<String>,
 }
 
 impl ChunkSink {
-    fn emit(&self, text: impl Into<String>) {
+    pub(crate) fn emit(&self, text: impl Into<String>) {
         let _ = self.tx.send(text.into());
     }
 }
 
-trait BandAdapter {
-    async fn execute(&self, ctx: TurnCtx<'_>) -> Result<AdapterOutcome>;
-}
-
-struct TurnCtx<'a> {
-    workspace_dir: &'a Path,
-    session_id: SessionId,
-    seq: i64,
-    input: &'a str,
-    model: &'a str,
-    effort: Option<&'a str>,
-    resume_token: Option<&'a str>,
-    history_hint: &'a [TurnSummary],
-    chunk_sink: ChunkSink,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AdapterStatus {
+pub(crate) enum AdapterStatus {
     Done,
     Capped,
     Error,
+    Cancelled,
 }
 
 impl AdapterStatus {
@@ -374,20 +423,21 @@ impl AdapterStatus {
             Self::Done => TurnStatus::Done,
             Self::Capped => TurnStatus::Capped,
             Self::Error => TurnStatus::Error,
+            Self::Cancelled => TurnStatus::Cancelled,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct AdapterOutcome {
-    status: AdapterStatus,
-    envelope: Option<Envelope>,
-    resume_token: Option<String>,
-    error: Option<String>,
+pub(crate) struct AdapterOutcome {
+    pub(crate) status: AdapterStatus,
+    pub(crate) envelope: Option<Envelope>,
+    pub(crate) resume_token: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 impl AdapterOutcome {
-    fn done(envelope: Envelope, resume_token: Option<String>) -> Self {
+    pub(crate) fn done(envelope: Envelope, resume_token: Option<String>) -> Self {
         Self {
             status: AdapterStatus::Done,
             envelope: Some(envelope),
@@ -396,7 +446,7 @@ impl AdapterOutcome {
         }
     }
 
-    fn capped(error: impl Into<String>, resume_token: Option<String>) -> Self {
+    pub(crate) fn capped(error: impl Into<String>, resume_token: Option<String>) -> Self {
         Self {
             status: AdapterStatus::Capped,
             envelope: None,
@@ -405,12 +455,21 @@ impl AdapterOutcome {
         }
     }
 
-    fn error(error: impl Into<String>, resume_token: Option<String>) -> Self {
+    pub(crate) fn error(error: impl Into<String>, resume_token: Option<String>) -> Self {
         Self {
             status: AdapterStatus::Error,
             envelope: None,
             resume_token,
             error: Some(error.into()),
+        }
+    }
+
+    pub(crate) fn cancelled(resume_token: Option<String>) -> Self {
+        Self {
+            status: AdapterStatus::Cancelled,
+            envelope: None,
+            resume_token,
+            error: Some("cancelled by the user".to_string()),
         }
     }
 
@@ -423,332 +482,6 @@ impl AdapterOutcome {
             resume_token: self.resume_token,
         }
     }
-}
-
-struct MockAdapter;
-
-impl BandAdapter for MockAdapter {
-    async fn execute(&self, ctx: TurnCtx<'_>) -> Result<AdapterOutcome> {
-        let _ = (ctx.model, ctx.effort, ctx.resume_token, ctx.history_hint);
-        let path = ctx.workspace_dir.join(format!("turn-{}.txt", ctx.seq));
-        fs::write(&path, ctx.input)
-            .await
-            .with_context(|| format!("write mock turn file {}", path.display()))?;
-        ctx.chunk_sink.emit("mock: thinking");
-        ctx.chunk_sink.emit("mock: done");
-
-        Ok(AdapterOutcome::done(
-            Envelope {
-                headline: format!("mock turn {} complete", ctx.seq),
-                work_complete: true,
-                cannot_proceed: false,
-                body_markdown: format!("echo: {}", ctx.input),
-                questions: Vec::new(),
-            },
-            Some(format!("mock-{}", ctx.session_id)),
-        ))
-    }
-}
-
-struct ClaudeCodeAdapter;
-
-impl BandAdapter for ClaudeCodeAdapter {
-    async fn execute(&self, ctx: TurnCtx<'_>) -> Result<AdapterOutcome> {
-        let _ = ctx.effort;
-        let prompt = if ctx.resume_token.is_none() && !ctx.history_hint.is_empty() {
-            prompt_with_history(ctx.input, ctx.history_hint)
-        } else {
-            ctx.input.to_string()
-        };
-
-        let mut command = Command::new("claude");
-        command
-            .arg("-p")
-            .arg(prompt)
-            .arg("--model")
-            .arg(ctx.model)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .current_dir(ctx.workspace_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        if let Some(resume_token) = ctx.resume_token {
-            command.arg("--resume").arg(resume_token);
-        }
-
-        let mut child = command.spawn().context("spawn claude CLI")?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("claude stdout was not piped"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("claude stderr was not piped"))?;
-
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut stderr = String::new();
-            reader.read_to_string(&mut stderr).await.map(|_| stderr)
-        });
-
-        let mut lines = BufReader::new(stdout).lines();
-        let mut stream = ClaudeStreamState::default();
-        let timeout = time::sleep(CLAUDE_TIMEOUT);
-        tokio::pin!(timeout);
-
-        loop {
-            tokio::select! {
-                _ = &mut timeout => {
-                    let _ = child.kill().await;
-                    let stderr = join_stderr(stderr_task).await;
-                    return Ok(AdapterOutcome::error(
-                        timeout_message(&stderr),
-                        stream.resume_token,
-                    ));
-                }
-                line = lines.next_line() => {
-                    match line.context("read claude stdout")? {
-                        Some(line) => {
-                            let chunks = stream.ingest_line(&line)?;
-                            for chunk in chunks {
-                                ctx.chunk_sink.emit(chunk);
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        let status = tokio::select! {
-            _ = &mut timeout => {
-                let _ = child.kill().await;
-                let stderr = join_stderr(stderr_task).await;
-                return Ok(AdapterOutcome::error(
-                    timeout_message(&stderr),
-                    stream.resume_token,
-                ));
-            }
-            status = child.wait() => status.context("wait for claude CLI")?,
-        };
-
-        let stderr = join_stderr(stderr_task).await;
-        if !status.success() {
-            let message = tail_chars(&stderr, STDERR_TAIL_CHARS);
-            if is_capped_error(&stderr) {
-                return Ok(AdapterOutcome::capped(message, stream.resume_token));
-            }
-            return Ok(AdapterOutcome::error(message, stream.resume_token));
-        }
-
-        let reply = stream.reply_text();
-        let resume_token = stream.resume_token.clone();
-        let envelope = Envelope {
-            headline: headline_from_reply(&reply),
-            work_complete: true,
-            cannot_proceed: false,
-            body_markdown: reply,
-            questions: Vec::new(),
-        };
-        Ok(AdapterOutcome::done(envelope, resume_token))
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ClaudeStreamParse {
-    resume_token: Option<String>,
-    chunks: Vec<String>,
-    reply: String,
-}
-
-#[derive(Debug, Default)]
-struct ClaudeStreamState {
-    resume_token: Option<String>,
-    streamed_reply: String,
-    final_reply: Option<String>,
-}
-
-impl ClaudeStreamState {
-    fn ingest_line(&mut self, line: &str) -> Result<Vec<String>> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let value: Value =
-            serde_json::from_str(line).with_context(|| format!("parse claude stream line: {line}"))?;
-
-        if self.resume_token.is_none() {
-            self.resume_token = session_id_from(&value);
-        }
-
-        match value.get("type").and_then(Value::as_str) {
-            Some("assistant") => {
-                let chunks = assistant_text_chunks(&value);
-                for chunk in &chunks {
-                    self.streamed_reply.push_str(chunk);
-                }
-                Ok(chunks)
-            }
-            Some("result") => {
-                if let Some(text) = result_text(&value) {
-                    self.final_reply = Some(text);
-                }
-                if self.resume_token.is_none() {
-                    self.resume_token = session_id_from(&value);
-                }
-                Ok(Vec::new())
-            }
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    fn reply_text(&self) -> String {
-        self.final_reply
-            .clone()
-            .unwrap_or_else(|| self.streamed_reply.clone())
-    }
-}
-
-#[cfg(test)]
-fn parse_claude_stream(input: &str) -> Result<ClaudeStreamParse> {
-    let mut state = ClaudeStreamState::default();
-    let mut chunks = Vec::new();
-    for line in input.lines() {
-        chunks.extend(state.ingest_line(line)?);
-    }
-    Ok(ClaudeStreamParse {
-        resume_token: state.resume_token.clone(),
-        chunks,
-        reply: state.reply_text(),
-    })
-}
-
-fn session_id_from(value: &Value) -> Option<String> {
-    value
-        .get("session_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            value
-                .get("message")
-                .and_then(|message| message.get("session_id"))
-                .and_then(Value::as_str)
-        })
-        .map(ToOwned::to_owned)
-}
-
-fn assistant_text_chunks(value: &Value) -> Vec<String> {
-    let mut chunks = Vec::new();
-
-    if let Some(text) = value
-        .get("delta")
-        .and_then(|delta| delta.get("text"))
-        .and_then(Value::as_str)
-    {
-        chunks.push(text.to_string());
-    }
-
-    if let Some(text) = value.get("text").and_then(Value::as_str) {
-        chunks.push(text.to_string());
-    }
-
-    if let Some(message) = value.get("message") {
-        collect_content_text(message.get("content"), &mut chunks);
-        if let Some(text) = message.get("text").and_then(Value::as_str) {
-            chunks.push(text.to_string());
-        }
-    }
-
-    collect_content_text(value.get("content"), &mut chunks);
-    chunks
-}
-
-fn result_text(value: &Value) -> Option<String> {
-    if let Some(result) = value.get("result") {
-        if let Some(text) = result.as_str() {
-            return Some(text.to_string());
-        }
-        let mut chunks = Vec::new();
-        collect_content_text(Some(result), &mut chunks);
-        if !chunks.is_empty() {
-            return Some(chunks.concat());
-        }
-    }
-
-    if let Some(text) = value.get("text").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
-
-    if let Some(message) = value.get("message") {
-        let mut chunks = Vec::new();
-        collect_content_text(message.get("content"), &mut chunks);
-        if !chunks.is_empty() {
-            return Some(chunks.concat());
-        }
-    }
-
-    let mut chunks = Vec::new();
-    collect_content_text(value.get("content"), &mut chunks);
-    if chunks.is_empty() {
-        None
-    } else {
-        Some(chunks.concat())
-    }
-}
-
-fn collect_content_text(value: Option<&Value>, chunks: &mut Vec<String>) {
-    let Some(value) = value else {
-        return;
-    };
-
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                collect_content_text(Some(item), chunks);
-            }
-        }
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(text) = map.get("text").and_then(Value::as_str) {
-                    chunks.push(text.to_string());
-                }
-            }
-            if let Some(delta) = map.get("delta") {
-                if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                    chunks.push(text.to_string());
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn prompt_with_history(input: &str, history_hint: &[TurnSummary]) -> String {
-    let mut prompt = String::from("Prior turns:\n");
-    for (idx, turn) in history_hint.iter().enumerate() {
-        prompt.push_str(&format!("{}. User: {}\n", idx + 1, turn.input));
-        if let Some(headline) = &turn.headline {
-            prompt.push_str(&format!("   Outcome: {headline}\n"));
-        }
-    }
-    prompt.push_str("\nCurrent turn:\n");
-    prompt.push_str(input);
-    prompt
-}
-
-fn headline_from_reply(reply: &str) -> String {
-    let headline = reply
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("Claude turn complete");
-    truncate_chars(headline, 120)
 }
 
 #[derive(Debug, Clone)]
@@ -764,11 +497,12 @@ impl WorkspaceManager {
     async fn ensure(&self, session: &Session) -> Result<Workspace> {
         let session_dir = self.data_dir.join("sessions").join(session.id.to_string());
         let workspace_dir = session_dir.join("ws");
-        let branch = session_branch(session.id);
+        let branch = session_branch(session);
 
         if fs::try_exists(&workspace_dir).await.unwrap_or(false) {
             return Ok(Workspace {
                 dir: workspace_dir,
+                session_dir,
                 branch,
             });
         }
@@ -797,6 +531,7 @@ impl WorkspaceManager {
             if resume_remote_branch(&workspace_dir, &branch).await? {
                 return Ok(Workspace {
                     dir: workspace_dir,
+                    session_dir,
                     branch,
                 });
             }
@@ -815,6 +550,7 @@ impl WorkspaceManager {
         checkout_session_branch(&workspace_dir, &branch).await?;
         Ok(Workspace {
             dir: workspace_dir,
+            session_dir,
             branch,
         })
     }
@@ -823,12 +559,17 @@ impl WorkspaceManager {
 #[derive(Debug, Clone)]
 struct Workspace {
     dir: PathBuf,
+    session_dir: PathBuf,
     branch: String,
 }
 
 impl Workspace {
     fn path(&self) -> &Path {
         &self.dir
+    }
+
+    fn session_dir(&self) -> &Path {
+        &self.session_dir
     }
 
     async fn commit_turn(&self, seq: i64) -> Result<String> {
@@ -1025,8 +766,33 @@ fn str_args<const N: usize>(args: [&str; N]) -> Vec<String> {
     args.into_iter().map(ToOwned::to_owned).collect()
 }
 
-fn session_branch(session_id: SessionId) -> String {
-    format!("ceilidh/session-{session_id}")
+/// `ceilidh/<title-slug>-<id8>`: readable on GitHub, unique per session.
+fn session_branch(session: &Session) -> String {
+    let id8: String = session.id.simple().to_string().chars().take(8).collect();
+    let slug = slugify(&session.title);
+    if slug.is_empty() {
+        format!("ceilidh/session-{id8}")
+    } else {
+        format!("ceilidh/{slug}-{id8}")
+    }
+}
+
+fn slugify(title: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = true;
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+        if out.len() >= 40 {
+            break;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 fn is_git_identity_error(message: &str) -> bool {
@@ -1058,37 +824,9 @@ fn next_backoff(current: Duration) -> Duration {
     Duration::from_secs((current.as_secs() * 2).min(MAX_BACKOFF_SECONDS))
 }
 
-fn joinable_tail(stderr: &str) -> String {
-    let tail = tail_chars(stderr, STDERR_TAIL_CHARS);
-    if tail.is_empty() {
-        "claude exited without stderr".to_string()
-    } else {
-        tail
-    }
-}
 
-async fn join_stderr(task: tokio::task::JoinHandle<std::io::Result<String>>) -> String {
-    match task.await {
-        Ok(Ok(stderr)) => stderr,
-        Ok(Err(err)) => format!("failed to read stderr: {err}"),
-        Err(err) => format!("stderr reader task failed: {err}"),
-    }
-}
 
-fn timeout_message(stderr: &str) -> String {
-    let stderr = joinable_tail(stderr);
-    format!("claude timed out after 30 minutes: {stderr}")
-}
 
-fn is_capped_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("rate limit")
-        || lower.contains("rate_limit")
-        || lower.contains("usage limit")
-        || lower.contains("usage_limit")
-        || lower.contains("capped")
-        || lower.contains("cap reached")
-}
 
 fn append_error(error: &mut Option<String>, message: String) {
     match error {
@@ -1100,94 +838,14 @@ fn append_error(error: &mut Option<String>, message: String) {
     }
 }
 
-fn truncate_chars(input: &str, max: usize) -> String {
-    let len = input.chars().count();
-    if len <= max {
-        return input.to_string();
-    }
 
-    if max <= 3 {
-        return input.chars().take(max).collect();
-    }
-
-    let mut output = input.chars().take(max - 3).collect::<String>();
-    output.push_str("...");
-    output
-}
-
-fn tail_chars(input: &str, max: usize) -> String {
-    let input = input.trim();
-    let len = input.chars().count();
-    if len <= max {
-        return input.to_string();
-    }
-
-    let tail = input
-        .chars()
-        .rev()
-        .take(max)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!("...{tail}")
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ceilidh_protocol::{Lane, SessionProfile, SessionStatus, Turn};
+    use ceilidh_protocol::{Lane, SessionProfile, SessionStatus};
     use chrono::TimeZone;
     use uuid::Uuid;
-
-    #[tokio::test]
-    async fn mock_adapter_writes_turn_file_and_echoes_chunks() {
-        let dir = unique_temp_dir("mock-adapter");
-        fs::create_dir_all(&dir).await.unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let session_id = Uuid::new_v4();
-        let ctx = TurnCtx {
-            workspace_dir: &dir,
-            session_id,
-            seq: 7,
-            input: "hello runner",
-            model: "mock",
-            effort: None,
-            resume_token: None,
-            history_hint: &[],
-            chunk_sink: ChunkSink { tx },
-        };
-
-        let outcome = MockAdapter.execute(ctx).await.unwrap();
-
-        assert_eq!(outcome.status, AdapterStatus::Done);
-        assert_eq!(
-            outcome.envelope.unwrap().body_markdown,
-            "echo: hello runner"
-        );
-        assert_eq!(outcome.resume_token, Some(format!("mock-{session_id}")));
-        assert_eq!(
-            fs::read_to_string(dir.join("turn-7.txt")).await.unwrap(),
-            "hello runner"
-        );
-        assert_eq!(rx.recv().await.as_deref(), Some("mock: thinking"));
-        assert_eq!(rx.recv().await.as_deref(), Some("mock: done"));
-        fs::remove_dir_all(dir).await.unwrap();
-    }
-
-    #[test]
-    fn claude_stream_json_parser_captures_token_chunks_and_result() {
-        let fixture = r#"{"type":"system","subtype":"init","session_id":"session-123"}
-{"type":"assistant","delta":{"text":"hello"}}
-{"type":"assistant","message":{"content":[{"type":"text","text":" world"}]}}
-{"type":"result","result":"hello world\nsecond line"}"#;
-
-        let parsed = parse_claude_stream(fixture).unwrap();
-
-        assert_eq!(parsed.resume_token.as_deref(), Some("session-123"));
-        assert_eq!(parsed.chunks, vec!["hello", " world"]);
-        assert_eq!(parsed.reply, "hello world\nsecond line");
-    }
 
     #[tokio::test]
     async fn workspace_manager_initializes_scratch_workspace_and_commits_turn() {
@@ -1201,6 +859,7 @@ mod tests {
 
         let workspace = manager.ensure(&session).await.unwrap();
         assert!(fs::try_exists(workspace.path().join(".git")).await.unwrap());
+        assert!(workspace.branch.starts_with("ceilidh/test-session-"));
 
         fs::write(workspace.path().join("answer.txt"), "done")
             .await
@@ -1212,10 +871,21 @@ mod tests {
         fs::remove_dir_all(data_dir).await.unwrap();
     }
 
+    #[test]
+    fn branch_names_are_slugged_and_unique() {
+        let mut session = test_session(SessionProfile::default());
+        session.title = "Fix the Login Bug!!".to_string();
+        let branch = session_branch(&session);
+        assert!(branch.starts_with("ceilidh/fix-the-login-bug-"));
+        session.title = "   ".to_string();
+        assert!(session_branch(&session).starts_with("ceilidh/session-"));
+        assert_eq!(slugify("A".repeat(80).as_str()).len(), 40);
+    }
+
     fn test_session(profile: SessionProfile) -> Session {
         Session {
             id: Uuid::new_v4(),
-            title: "test".to_string(),
+            title: "test session".to_string(),
             lane: Lane {
                 harness: Harness::Mock,
                 model: "mock".to_string(),
@@ -1224,27 +894,9 @@ mod tests {
             profile,
             runner_affinity: None,
             status: SessionStatus::Active,
+            parent_id: None,
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             updated_at: Utc.timestamp_opt(0, 0).unwrap(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn test_turn(session_id: SessionId) -> Turn {
-        Turn {
-            id: Uuid::new_v4(),
-            session_id,
-            seq: 1,
-            input: "input".to_string(),
-            lane_override: None,
-            status: TurnStatus::Claimed,
-            envelope: None,
-            error: None,
-            commit: None,
-            resume_token: None,
-            created_at: Utc.timestamp_opt(0, 0).unwrap(),
-            started_at: None,
-            finished_at: None,
         }
     }
 

@@ -23,6 +23,7 @@ async fn runner_flow_emits_sse_and_persists_final_state() -> Result<()> {
         bind: "127.0.0.1:0".parse()?,
         db_path,
         token: Some("secret".to_string()),
+        default_repo_url: None,
     })
     .await?;
 
@@ -60,6 +61,7 @@ async fn runner_flow_emits_sse_and_persists_final_state() -> Result<()> {
                 effort: None,
             }),
             profile: None,
+            parent_id: None,
         },
     )
     .await?;
@@ -211,6 +213,7 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
         bind: "127.0.0.1:0".parse()?,
         db_path: placeholder_dir.join("ceilidh.db"),
         token: None,
+        default_repo_url: None,
     })
     .await?;
 
@@ -233,6 +236,7 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
             bind: "127.0.0.1:0".parse()?,
             db_path: web_dir.join("ceilidh.db"),
             token: None,
+            default_repo_url: None,
         },
         Some(web_dir.clone()),
     )
@@ -382,6 +386,7 @@ async fn claim_carries_forward_the_previous_resume_token() -> Result<()> {
         bind: "127.0.0.1:0".parse()?,
         db_path: dir.join("ceilidh.db"),
         token: None,
+        default_repo_url: None,
     })
     .await?;
 
@@ -398,6 +403,7 @@ async fn claim_carries_forward_the_previous_resume_token() -> Result<()> {
                 effort: None,
             }),
             profile: None,
+            parent_id: None,
         },
     )
     .await?;
@@ -486,6 +492,7 @@ async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
         bind: "127.0.0.1:0".parse()?,
         db_path: dir.join("ceilidh.db"),
         token: None,
+        default_repo_url: None,
     })
     .await?;
 
@@ -502,6 +509,7 @@ async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
                 effort: None,
             }),
             profile: None,
+            parent_id: None,
         },
     )
     .await?;

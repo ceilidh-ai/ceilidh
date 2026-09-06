@@ -5,6 +5,7 @@ members = [
     "crates/ceilidh-caller",
     "crates/ceilidh-runner",
     "crates/ceilidh-server",
+    "crates/ceilidh-mcp",
     "crates/ceilidh-cli",
 ]
 
@@ -19,6 +20,7 @@ ceilidh-protocol = { path = "crates/ceilidh-protocol" }
 ceilidh-caller = { path = "crates/ceilidh-caller" }
 ceilidh-runner = { path = "crates/ceilidh-runner" }
 ceilidh-server = { path = "crates/ceilidh-server" }
+ceilidh-mcp = { path = "crates/ceilidh-mcp" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
