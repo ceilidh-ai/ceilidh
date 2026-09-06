@@ -2,23 +2,29 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
   type KeyboardEvent,
 } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type {
+  CallerConfig,
   CreateSessionRequest,
+  Envelope,
   Event,
   Harness,
   Lane,
+  ModelChoice,
   RunnerStatusInfo,
   Session,
   SessionId,
   Turn,
   TurnId,
+  TurnStatus,
 } from './protocol'
 import {
+  applyTurn,
   emptyClientState,
   foldEvent,
   setRunners,
@@ -29,12 +35,27 @@ import {
 
 const tokenStorageKey = 'ceilidh.token'
 const inFlightStatuses = new Set(['queued', 'claimed', 'working'])
+const maxTreeDepth = 3
+const sessionHydrationLimit = 40
+const otherModelKey = '__other__'
+const emptyConfig: CallerConfig = { default_repo_url: null, models: [] }
+const dotClasses: Record<TurnStatus, string> = {
+  queued: 'animate-pulse bg-amber-300 shadow-[0_0_0_4px_rgba(252,211,77,0.14)]',
+  claimed: 'animate-pulse bg-sky-300 shadow-[0_0_0_4px_rgba(125,211,252,0.14)]',
+  working: 'animate-pulse bg-sky-300 shadow-[0_0_0_4px_rgba(125,211,252,0.14)]',
+  done: 'bg-emerald-400',
+  error: 'bg-rose-400',
+  capped: 'bg-rose-400',
+  cancelled: 'bg-slate-400',
+}
 const eventNames = [
   'turn_queued',
   'turn_claimed',
   'chunk',
   'turn_done',
   'turn_error',
+  'turn_cancelled',
+  'session_created',
   'runner_status',
 ]
 
@@ -43,6 +64,17 @@ type ApiRequestInit = Omit<RequestInit, 'body'> & {
 }
 
 type Pane = 'sessions' | 'chat' | 'new'
+
+type ComposerNote = {
+  kind: 'error' | 'notice'
+  text: string
+}
+
+type SessionNode = {
+  session: Session
+  depth: number
+  childCount: number
+}
 
 class ApiError extends Error {
   status: number
@@ -87,6 +119,7 @@ function Workbench({
   )
   const [pane, setPane] = useState<Pane>('sessions')
   const [creating, setCreating] = useState(false)
+  const [config, setConfig] = useState<CallerConfig | null>(null)
   const [loadingOverview, setLoadingOverview] = useState(true)
   const [overviewError, setOverviewError] = useState<string | null>(null)
   const [sendingSessionId, setSendingSessionId] = useState<SessionId | null>(
@@ -97,15 +130,51 @@ function Workbench({
     setState((current) => foldEvent(current, event))
   }, [])
 
+  // Every row carries a status dot, so the list needs turns for sessions the
+  // operator has not opened. Bounded, and the stream keeps them fresh after.
+  const hydrateTurns = useCallback(
+    async (targets: Session[]) => {
+      const loaded = await Promise.all(
+        targets.map(async (session) => {
+          try {
+            const payload = await apiFetch<unknown>(
+              `/api/sessions/${session.id}/turns`,
+            )
+
+            return {
+              sessionId: session.id,
+              turns: collectionFromPayload<Turn>(payload, 'turns'),
+            }
+          } catch {
+            return null
+          }
+        }),
+      )
+
+      setState((current) =>
+        loaded.reduce(
+          (carried, entry) =>
+            entry ? setTurns(carried, entry.sessionId, entry.turns) : carried,
+          current,
+        ),
+      )
+    },
+    [apiFetch],
+  )
+
   const refreshOverview = useCallback(async () => {
     setLoadingOverview(true)
     setOverviewError(null)
 
     try {
-      const [sessionsPayload, runnersPayload] = await Promise.all([
-        apiFetch<unknown>('/api/sessions'),
-        apiFetch<unknown>('/api/runners'),
-      ])
+      const [configPayload, sessionsPayload, runnersPayload] =
+        await Promise.all([
+          // A config the caller cannot serve still leaves the form usable
+          // through its free-text model path.
+          apiFetch<unknown>('/api/config').catch(() => null),
+          apiFetch<unknown>('/api/sessions'),
+          apiFetch<unknown>('/api/runners'),
+        ])
       const sessions = collectionFromPayload<Session>(
         sessionsPayload,
         'sessions',
@@ -115,14 +184,16 @@ function Workbench({
         'runners',
       )
 
+      setConfig(configFromPayload(configPayload))
       setState((current) => setRunners(setSessions(current, sessions), runners))
       setSelectedSessionId((current) => current ?? sessions[0]?.id ?? null)
+      await hydrateTurns(sessions.slice(0, sessionHydrationLimit))
     } catch (error) {
       setOverviewError(errorMessage(error))
     } finally {
       setLoadingOverview(false)
     }
-  }, [apiFetch])
+  }, [apiFetch, hydrateTurns])
 
   const refreshTurns = useCallback(
     async (sessionId: SessionId) => {
@@ -158,12 +229,6 @@ function Workbench({
   }, [refreshTurns, selectedSessionId])
 
   useEventSource(eventUrl('/api/events', token), applyEvent)
-  useEventSource(
-    selectedSessionId
-      ? eventUrl(`/api/sessions/${selectedSessionId}/events`, token)
-      : null,
-    applyEvent,
-  )
 
   const selectedSession =
     state.sessions.find((session) => session.id === selectedSessionId) ?? null
@@ -208,6 +273,21 @@ function Workbench({
     setPane('chat')
   }
 
+  const cancelTurn = async (sessionId: SessionId, turnId: TurnId) => {
+    const payload = await apiFetch<unknown>(
+      `/api/sessions/${sessionId}/turns/${turnId}/cancel`,
+      { method: 'POST' },
+    )
+    const turn = singleFromPayload<Turn>(payload, 'turn')
+
+    if (turn?.id) {
+      setState((current) => applyTurn(current, turn))
+      return
+    }
+
+    await refreshTurns(sessionId)
+  }
+
   const sendTurn = async (sessionId: SessionId, input: string) => {
     setSendingSessionId(sessionId)
 
@@ -237,14 +317,29 @@ function Workbench({
   }
 
   const mainPane = creating ? (
-    <NewSessionForm onCancel={closeMainPane} onCreate={createSession} />
+    config ? (
+      <NewSessionForm
+        config={config}
+        onCancel={closeMainPane}
+        onCreate={createSession}
+      />
+    ) : (
+      <section className="flex min-h-0 flex-1 items-center justify-center p-4">
+        <span className="spinner" />
+      </section>
+    )
   ) : selectedSession ? (
     <ChatView
+      childSessions={childrenOf(state.sessions, selectedSession.id)}
       liveChunks={state.liveChunks}
       onBack={closeMainPane}
+      onCancel={(turnId) => cancelTurn(selectedSession.id, turnId)}
+      onOpenSession={selectSession}
       onSend={(input) => sendTurn(selectedSession.id, input)}
+      parentSession={parentOf(state.sessions, selectedSession)}
       sending={sendingSessionId === selectedSession.id}
       session={selectedSession}
+      sessionTurnMap={sessionTurnMap}
       turns={selectedTurns}
     />
   ) : (
@@ -252,10 +347,10 @@ function Workbench({
   )
 
   return (
-    <div className="flex min-h-svh flex-col bg-[#080b10] text-slate-100">
-      <div className="grid min-h-0 flex-1 md:grid-cols-[22rem_minmax(0,1fr)]">
+    <div className="flex h-svh flex-col overflow-hidden bg-[#080b10] text-slate-100">
+      <div className="grid min-h-0 min-w-0 flex-1 md:grid-cols-[22rem_minmax(0,1fr)]">
         <aside
-          className={`${pane === 'sessions' ? 'flex' : 'hidden'} min-h-0 flex-col border-r border-slate-800 bg-[#0c1118] md:flex`}
+          className={`${pane === 'sessions' ? 'flex' : 'hidden'} min-h-0 min-w-0 flex-col border-r border-slate-800 bg-[#0c1118] md:flex`}
         >
           <SessionsPanel
             loading={loadingOverview}
@@ -275,7 +370,7 @@ function Workbench({
         </aside>
 
         <main
-          className={`${pane === 'sessions' ? 'hidden' : 'flex'} min-h-0 flex-col bg-[#090d13] md:flex`}
+          className={`${pane === 'sessions' ? 'hidden' : 'flex'} min-h-0 min-w-0 flex-col bg-[#090d13] md:flex`}
         >
           {mainPane}
         </main>
@@ -321,7 +416,7 @@ function TokenScreen({ onSave }: { onSave: (token: string) => void }) {
           <input
             autoComplete="off"
             autoFocus
-            className="mt-2 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-base text-slate-100 outline-none transition focus:border-emerald-300"
+            className="mt-2 h-11 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-[16px] text-slate-100 outline-none transition focus:border-emerald-300"
             onChange={(event) => {
               setValue(event.target.value)
               setError(null)
@@ -334,7 +429,7 @@ function TokenScreen({ onSave }: { onSave: (token: string) => void }) {
         {error ? <p className="mt-3 text-sm text-rose-300">{error}</p> : null}
 
         <button
-          className="mt-5 inline-flex h-10 w-full items-center justify-center rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200 focus:outline-none focus:ring-2 focus:ring-emerald-200 focus:ring-offset-2 focus:ring-offset-slate-950"
+          className="mt-5 inline-flex h-11 w-full items-center justify-center rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200 focus:outline-none focus:ring-2 focus:ring-emerald-200 focus:ring-offset-2 focus:ring-offset-slate-950"
           type="submit"
         >
           Continue
@@ -363,6 +458,9 @@ function SessionsPanel({
   sessionTurnMap: Record<SessionId, Turn[]>
   sessions: Session[]
 }) {
+  const nodes = useMemo(() => buildSessionTree(sessions), [sessions])
+  const now = useNow(30_000)
+
   return (
     <>
       <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-4 py-3">
@@ -373,14 +471,14 @@ function SessionsPanel({
         <div className="flex items-center gap-2">
           <button
             aria-label="Refresh sessions"
-            className="inline-flex h-9 min-w-16 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-500"
+            className="inline-flex h-11 min-w-16 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-500"
             onClick={onRefresh}
             type="button"
           >
             {loading ? <span className="spinner" /> : 'Reload'}
           </button>
           <button
-            className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-emerald-300 px-3 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200"
+            className="inline-flex h-11 items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200"
             onClick={onNewSession}
             type="button"
           >
@@ -390,7 +488,7 @@ function SessionsPanel({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         {sessions.length === 0 && !loading ? (
           <div className="px-4 py-8 text-sm text-slate-400">
             No sessions yet.
@@ -398,43 +496,22 @@ function SessionsPanel({
         ) : null}
 
         <div className="divide-y divide-slate-800/80">
-          {sessions.map((session) => {
-            const turns = sessionTurnMap[session.id] ?? []
-            const runState = sessionRunState(turns)
-
-            return (
-              <button
-                className={`block w-full px-4 py-3 text-left transition hover:bg-slate-900/80 ${
-                  selectedSessionId === session.id ? 'bg-slate-900' : ''
-                }`}
-                key={session.id}
-                onClick={() => onSelect(session.id)}
-                type="button"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold text-slate-100">
-                      {session.title}
-                    </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-                      <LaneBadge lane={session.lane} />
-                      <span>{session.runner_affinity ?? 'unassigned'}</span>
-                    </div>
-                  </div>
-                  <RunStateDot state={runState} />
-                </div>
-                <div className="mt-2 text-xs text-slate-500">
-                  {formatDateTime(session.updated_at)}
-                </div>
-              </button>
-            )
-          })}
+          {nodes.map((node) => (
+            <SessionRow
+              key={node.session.id}
+              node={node}
+              now={now}
+              onSelect={onSelect}
+              selected={selectedSessionId === node.session.id}
+              turns={sessionTurnMap[node.session.id]}
+            />
+          ))}
         </div>
       </div>
 
-      <div className="border-t border-slate-800 px-4 py-3">
+      <div className="border-t border-slate-800 px-4 py-2">
         <button
-          className="text-sm font-medium text-slate-400 transition hover:text-slate-100"
+          className="inline-flex h-11 items-center text-sm font-medium text-slate-400 transition hover:text-slate-100"
           onClick={onChangeToken}
           type="button"
         >
@@ -445,22 +522,90 @@ function SessionsPanel({
   )
 }
 
+function SessionRow({
+  node,
+  now,
+  onSelect,
+  selected,
+  turns,
+}: {
+  node: SessionNode
+  now: number
+  onSelect: (sessionId: SessionId) => void
+  selected: boolean
+  turns: Turn[] | undefined
+}) {
+  const { childCount, depth, session } = node
+
+  return (
+    <button
+      className={`flex min-h-14 w-full items-start gap-2 py-3 pr-4 text-left transition hover:bg-slate-900/80 ${
+        selected ? 'bg-slate-900' : ''
+      }`}
+      onClick={() => onSelect(session.id)}
+      style={{ paddingLeft: `${1 + depth * 1.1}rem` }}
+      type="button"
+    >
+      {depth > 0 ? (
+        <span aria-hidden="true" className="mt-0.5 text-xs text-slate-600">
+          &#9492;
+        </span>
+      ) : null}
+
+      <span className="min-w-0 flex-1">
+        <span className="flex items-start justify-between gap-2">
+          <span className="min-w-0 truncate text-sm font-semibold text-slate-100">
+            {session.title}
+          </span>
+          <TurnStatusDot status={latestTurnStatus(turns)} />
+        </span>
+        <span className="mt-1 flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400">
+          <LaneBadge lane={session.lane} />
+          {childCount > 0 ? (
+            <span className="text-slate-500">
+              {childCount} sub-agent{childCount === 1 ? '' : 's'}
+            </span>
+          ) : null}
+          <span className="text-slate-500">
+            {formatRelative(session.updated_at, now)}
+          </span>
+        </span>
+      </span>
+    </button>
+  )
+}
+
 function NewSessionForm({
+  config,
   onCancel,
   onCreate,
 }: {
+  config: CallerConfig
   onCancel: () => void
   onCreate: (request: CreateSessionRequest) => Promise<void>
 }) {
+  const groups = useMemo(() => groupModels(config.models), [config.models])
   const [title, setTitle] = useState('')
+  const [choiceKey, setChoiceKey] = useState(
+    () => firstModelKey(config.models) ?? otherModelKey,
+  )
   const [harness, setHarness] = useState<Harness>('claude-code')
-  const [model, setModel] = useState(defaultModelForHarness('claude-code'))
+  const [model, setModel] = useState(() =>
+    defaultModelForHarness('claude-code'),
+  )
   const [effort, setEffort] = useState('')
-  const [repoUrl, setRepoUrl] = useState('')
+  const [repoUrl, setRepoUrl] = useState(() => config.default_repo_url ?? '')
   const [baseBranch, setBaseBranch] = useState('')
-  const [allowPush, setAllowPush] = useState(false)
+  const [pushChoice, setPushChoice] = useState<boolean | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const choice = config.models.find((item) => modelKey(item) === choiceKey)
+  const custom = !choice
+  const repoSet = repoUrl.trim().length > 0
+  // A scratch workspace has nothing to push to, so the toggle only bites when
+  // a repository is set, and it is on by default when one is.
+  const allowPush = repoSet && (pushChoice ?? true)
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -471,13 +616,17 @@ function NewSessionForm({
       return
     }
 
-    setSubmitting(true)
-    setError(null)
+    const cleanedModel = custom ? model.trim() : choice.model
+
+    if (!cleanedModel) {
+      setError('Model is required.')
+      return
+    }
 
     const lane: Lane = {
-      harness,
-      model: model.trim() || defaultModelForHarness(harness),
-      ...optionalField('effort', effort),
+      harness: custom ? harness : choice.harness,
+      model: cleanedModel,
+      ...(custom ? optionalField('effort', effort) : {}),
     }
     const request: CreateSessionRequest = {
       title: cleanedTitle,
@@ -488,6 +637,9 @@ function NewSessionForm({
         allow_push: allowPush,
       },
     }
+
+    setSubmitting(true)
+    setError(null)
 
     try {
       await onCreate(request)
@@ -511,7 +663,7 @@ function NewSessionForm({
     <section className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center gap-3 border-b border-slate-800 px-4 py-3">
         <button
-          className="inline-flex h-9 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 md:hidden"
+          className="inline-flex h-11 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 md:hidden"
           onClick={onCancel}
           type="button"
         >
@@ -524,10 +676,10 @@ function NewSessionForm({
       </div>
 
       <form
-        className="mx-auto grid w-full max-w-3xl gap-4 overflow-y-auto p-4 md:grid-cols-2 md:p-6"
+        className="mx-auto grid w-full max-w-2xl content-start gap-4 overflow-y-auto overscroll-contain p-4 md:p-6"
         onSubmit={submit}
       >
-        <label className="grid gap-2 text-sm font-medium text-slate-300 md:col-span-2">
+        <label className="grid gap-2 text-sm font-medium text-slate-300">
           Title
           <input
             autoFocus
@@ -541,84 +693,129 @@ function NewSessionForm({
         </label>
 
         <label className="grid gap-2 text-sm font-medium text-slate-300">
-          Harness
+          Model
           <select
             className="form-field"
-            onChange={(event) => changeHarness(event.target.value as Harness)}
-            value={harness}
+            onChange={(event) => setChoiceKey(event.target.value)}
+            value={choiceKey}
           >
-            <option value="claude-code">claude-code</option>
-            <option value="codex">codex</option>
-            <option value="mock">mock</option>
+            {groups.map((group) => (
+              <optgroup key={group.vendor} label={group.vendor}>
+                {group.choices.map((item) => (
+                  <option key={modelKey(item)} value={modelKey(item)}>
+                    {item.label}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+            <option value={otherModelKey}>Other model...</option>
           </select>
+          {choice ? (
+            <span className="text-xs text-slate-500">
+              {vendorForHarness(choice.harness)} / {choice.model}
+            </span>
+          ) : null}
         </label>
 
-        <label className="grid gap-2 text-sm font-medium text-slate-300">
-          Model
-          <input
-            className="form-field"
-            onChange={(event) => setModel(event.target.value)}
-            value={model}
-          />
-        </label>
+        {custom ? (
+          <div className="grid gap-4 rounded-md border border-slate-800 bg-slate-950/40 p-3 md:grid-cols-2">
+            <label className="grid gap-2 text-sm font-medium text-slate-300">
+              Harness
+              <select
+                className="form-field"
+                onChange={(event) =>
+                  changeHarness(event.target.value as Harness)
+                }
+                value={harness}
+              >
+                <option value="claude-code">claude-code</option>
+                <option value="codex">codex</option>
+                <option value="cursor">cursor</option>
+              </select>
+            </label>
+
+            <label className="grid gap-2 text-sm font-medium text-slate-300">
+              Effort
+              <input
+                className="form-field"
+                onChange={(event) => setEffort(event.target.value)}
+                placeholder="optional"
+                value={effort}
+              />
+            </label>
+
+            <label className="grid gap-2 text-sm font-medium text-slate-300 md:col-span-2">
+              Model id
+              <input
+                autoCapitalize="off"
+                autoCorrect="off"
+                className="form-field"
+                onChange={(event) => setModel(event.target.value)}
+                spellCheck={false}
+                value={model}
+              />
+            </label>
+          </div>
+        ) : null}
 
         <label className="grid gap-2 text-sm font-medium text-slate-300">
-          Effort
+          Repository
           <input
+            autoCapitalize="off"
+            autoCorrect="off"
             className="form-field"
-            onChange={(event) => setEffort(event.target.value)}
-            placeholder="optional"
-            value={effort}
+            inputMode="url"
+            onChange={(event) => setRepoUrl(event.target.value)}
+            placeholder="empty for a scratch workspace"
+            spellCheck={false}
+            value={repoUrl}
           />
         </label>
 
         <label className="grid gap-2 text-sm font-medium text-slate-300">
           Base branch
           <input
+            autoCapitalize="off"
+            autoCorrect="off"
             className="form-field"
             onChange={(event) => setBaseBranch(event.target.value)}
-            placeholder="optional"
+            placeholder="optional, repo default otherwise"
+            spellCheck={false}
             value={baseBranch}
           />
         </label>
 
-        <label className="grid gap-2 text-sm font-medium text-slate-300 md:col-span-2">
-          Repo URL
-          <input
-            className="form-field"
-            onChange={(event) => setRepoUrl(event.target.value)}
-            placeholder="optional"
-            type="url"
-            value={repoUrl}
-          />
-        </label>
-
-        <label className="flex items-center gap-3 rounded-md border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm font-medium text-slate-200 md:col-span-2">
+        <label
+          className={`flex min-h-11 items-center gap-3 rounded-md border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm font-medium ${
+            repoSet ? 'text-slate-200' : 'text-slate-500'
+          }`}
+        >
           <input
             checked={allowPush}
-            className="h-4 w-4 accent-emerald-300"
-            onChange={(event) => setAllowPush(event.target.checked)}
+            className="h-5 w-5 accent-emerald-300"
+            disabled={!repoSet}
+            onChange={(event) => setPushChoice(event.target.checked)}
             type="checkbox"
           />
-          Allow push
+          Push every turn
         </label>
 
         {error ? (
-          <div className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-100 md:col-span-2">
+          <div className="rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-100">
             {error}
           </div>
         ) : null}
 
-        <div className="flex items-center justify-end gap-2 md:col-span-2">
+        <div className="flex items-center justify-end gap-2">
           <button
-            className="hidden h-10 items-center rounded-md border border-slate-700 bg-slate-900 px-4 text-sm font-medium text-slate-200 transition hover:border-slate-500 md:inline-flex"
+            className="hidden h-11 items-center rounded-md border border-slate-700 bg-slate-900 px-4 text-sm font-medium text-slate-200 transition hover:border-slate-500 md:inline-flex"
             onClick={onCancel}
             type="button"
           >
             Cancel
           </button>
           <button
-            className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 md:w-auto"
+            className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 md:w-auto"
             disabled={submitting}
             type="submit"
           >
@@ -632,25 +829,46 @@ function NewSessionForm({
 }
 
 function ChatView({
+  childSessions,
   liveChunks,
   onBack,
+  onCancel,
+  onOpenSession,
   onSend,
+  parentSession,
   sending,
   session,
+  sessionTurnMap,
   turns,
 }: {
+  childSessions: Session[]
   liveChunks: Record<TurnId, string>
   onBack: () => void
+  onCancel: (turnId: TurnId) => Promise<void>
+  onOpenSession: (sessionId: SessionId) => void
   onSend: (input: string) => Promise<void>
+  parentSession: Session | null
   sending: boolean
   session: Session
+  sessionTurnMap: Record<SessionId, Turn[]>
   turns: Turn[]
 }) {
   const [input, setInput] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const latestRunState = sessionRunState(turns)
-  const turnInFlight = turns.some((turn) => inFlightStatuses.has(turn.status))
-  const disabled = sending || turnInFlight
+  const [note, setNote] = useState<ComposerNote | null>(null)
+  const [cancelling, setCancelling] = useState(false)
+  const bottom = useRef<HTMLDivElement | null>(null)
+  const inFlightTurn = turns.find((turn) => inFlightStatuses.has(turn.status))
+  const now = useNow(inFlightTurn ? 1_000 : 60_000)
+  const disabled = sending || inFlightTurn !== undefined
+  const repo = shortRepo(session.profile.repo_url)
+  const liveLength = turns.reduce(
+    (total, turn) => total + (liveChunks[turn.id]?.length ?? 0),
+    0,
+  )
+
+  useEffect(() => {
+    bottom.current?.scrollIntoView({ block: 'end' })
+  }, [liveLength, session.id, turns.length])
 
   const submit = async () => {
     const trimmed = input.trim()
@@ -659,13 +877,30 @@ function ChatView({
       return
     }
 
-    setError(null)
+    setNote(null)
 
     try {
       await onSend(trimmed)
       setInput('')
     } catch (sendError) {
-      setError(errorMessage(sendError))
+      setNote(composerNote(sendError))
+    }
+  }
+
+  const cancel = async () => {
+    if (!inFlightTurn || cancelling) {
+      return
+    }
+
+    setCancelling(true)
+    setNote(null)
+
+    try {
+      await onCancel(inFlightTurn.id)
+    } catch (cancelError) {
+      setNote(composerNote(cancelError))
+    } finally {
+      setCancelling(false)
     }
   }
 
@@ -678,76 +913,134 @@ function ChatView({
 
   return (
     <section className="flex min-h-0 flex-1 flex-col">
-      <header className="flex items-center justify-between gap-3 border-b border-slate-800 bg-[#0c1118] px-4 py-3">
-        <div className="flex min-w-0 items-center gap-3">
+      <header className="border-b border-slate-800 bg-[#0c1118] px-4 py-3">
+        <div className="flex min-w-0 items-start gap-3">
           <button
-            className="inline-flex h-9 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 md:hidden"
+            className="inline-flex h-11 shrink-0 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 md:hidden"
             onClick={onBack}
             type="button"
           >
             {'<'} Back
           </button>
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-2">
-              <RunStateDot state={latestRunState} />
+              <TurnStatusDot
+                className="mt-0"
+                status={latestTurnStatus(turns)}
+              />
               <h1 className="truncate text-base font-semibold text-white">
                 {session.title}
               </h1>
             </div>
-            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400">
               <LaneBadge lane={session.lane} />
+              {repo ? <span className="truncate">{repo}</span> : null}
               <span>{session.runner_affinity ?? 'unassigned'}</span>
-              <span>{formatDateTime(session.updated_at)}</span>
+              {parentSession ? (
+                <button
+                  className="inline-flex items-center gap-1 rounded-md border border-slate-700 px-2 py-1 text-xs text-slate-300 transition hover:border-slate-500 hover:text-white"
+                  onClick={() => onOpenSession(parentSession.id)}
+                  type="button"
+                >
+                  <span aria-hidden="true">&#8593;</span>
+                  <span className="max-w-40 truncate">
+                    {parentSession.title}
+                  </span>
+                </button>
+              ) : null}
             </div>
           </div>
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4 md:px-6">
+      {childSessions.length > 0 ? (
+        <div className="flex shrink-0 gap-2 overflow-x-auto border-b border-slate-800 bg-[#0c1118] px-4 py-2">
+          {childSessions.map((child) => (
+            <button
+              className="inline-flex min-h-11 shrink-0 items-center gap-2 rounded-full border border-slate-700 bg-slate-900 px-3 text-xs font-medium text-slate-200 transition hover:border-slate-500"
+              key={child.id}
+              onClick={() => onOpenSession(child.id)}
+              type="button"
+            >
+              <TurnStatusDot
+                className="mt-0"
+                status={latestTurnStatus(sessionTurnMap[child.id])}
+              />
+              <span className="max-w-40 truncate">{child.title}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-4 md:px-6">
         {turns.length === 0 ? (
           <div className="mx-auto mt-12 max-w-md rounded-md border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-400">
             No turns yet.
           </div>
         ) : null}
 
-        <div className="mx-auto flex max-w-4xl flex-col gap-4">
+        <div className="mx-auto flex max-w-4xl flex-col gap-5">
           {turns.map((turn) => (
-            <TurnBlock key={turn.id} liveText={liveChunks[turn.id]} turn={turn} />
+            <TurnBlock
+              key={turn.id}
+              liveText={liveChunks[turn.id]}
+              now={now}
+              turn={turn}
+            />
           ))}
         </div>
+        <div ref={bottom} />
       </div>
 
       <form
-        className="border-t border-slate-800 bg-[#0c1118] p-3 md:p-4"
+        className="shrink-0 border-t border-slate-800 bg-[#0c1118] px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] md:px-4"
         onSubmit={(event) => {
           event.preventDefault()
           void submit()
         }}
       >
         <div className="mx-auto max-w-4xl">
-          {error ? (
-            <div className="mb-2 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-100">
-              {error}
+          {note ? (
+            <div
+              className={`mb-2 rounded-md border px-3 py-2 text-sm ${
+                note.kind === 'error'
+                  ? 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+                  : 'border-amber-300/30 bg-amber-300/10 text-amber-100'
+              }`}
+            >
+              {note.text}
             </div>
           ) : null}
 
-          <div className="flex items-end gap-2">
-            <textarea
-              className="min-h-24 flex-1 resize-none rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-base leading-6 text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-emerald-300 disabled:cursor-not-allowed disabled:opacity-60"
-              disabled={disabled}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={keyDown}
-              placeholder={
-                turnInFlight ? 'Turn in flight' : 'Message for the next turn'
-              }
-              value={input}
-            />
+          <textarea
+            className="min-h-20 w-full resize-none rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-[16px] leading-6 text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-emerald-300 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={disabled}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={keyDown}
+            placeholder={
+              inFlightTurn ? 'Turn in flight' : 'Message for the next turn'
+            }
+            value={input}
+          />
+
+          <div className="mt-2 flex items-center justify-end gap-2">
+            {inFlightTurn ? (
+              <button
+                className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-md border border-rose-400/40 bg-rose-500/10 px-4 text-sm font-semibold text-rose-100 transition hover:border-rose-300 disabled:cursor-not-allowed disabled:opacity-60 md:flex-none"
+                disabled={cancelling || inFlightTurn.cancel_requested}
+                onClick={() => void cancel()}
+                type="button"
+              >
+                {cancelling ? <span className="spinner" /> : null}
+                {inFlightTurn.cancel_requested ? 'Cancelling' : 'Cancel'}
+              </button>
+            ) : null}
             <button
-              className="inline-flex h-11 min-w-24 items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300"
+              className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:bg-slate-600 disabled:text-slate-300 md:flex-none md:min-w-28"
               disabled={disabled || !input.trim()}
               type="submit"
             >
-              {sending || turnInFlight ? <span className="spinner dark" /> : null}
+              {sending ? <span className="spinner dark" /> : null}
               Send
             </button>
           </div>
@@ -757,66 +1050,87 @@ function ChatView({
   )
 }
 
-function TurnBlock({ liveText, turn }: { liveText?: string; turn: Turn }) {
-  const waiting =
-    inFlightStatuses.has(turn.status) && !liveText && !turn.envelope
+function TurnBlock({
+  liveText,
+  now,
+  turn,
+}: {
+  liveText?: string
+  now: number
+  turn: Turn
+}) {
+  const inFlight = inFlightStatuses.has(turn.status)
+  const failed = turn.status === 'error' || turn.status === 'capped'
+  // A cancel with nothing to say is already covered by the status line below.
+  const cancelled = turn.status === 'cancelled' && Boolean(turn.error)
 
   return (
-    <article className="grid gap-2">
-      <div className="flex justify-end">
-        <div className="max-w-[88%] rounded-md bg-sky-500 px-3 py-2 text-sm leading-6 text-white shadow-lg shadow-sky-950/20 md:max-w-[72%]">
-          <div className="whitespace-pre-wrap">{turn.input}</div>
+    <article className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
+      <div className="flex min-w-0 justify-end">
+        <div className="max-w-[88%] min-w-0 rounded-md bg-sky-500 px-3 py-2 text-sm leading-6 text-white shadow-lg shadow-sky-950/20 md:max-w-[72%]">
+          <div className="wrap-anywhere whitespace-pre-wrap">{turn.input}</div>
         </div>
       </div>
 
-      {turn.envelope ? <EnvelopeBubble turn={turn} /> : null}
-
-      {turn.error ? (
-        <div className="flex justify-start">
-          <div className="max-w-[88%] rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm leading-6 text-rose-100 md:max-w-[72%]">
-            {turn.error}
-          </div>
-        </div>
-      ) : null}
+      {turn.envelope ? <EnvelopeBubble envelope={turn.envelope} /> : null}
 
       {liveText ? (
-        <div className="flex justify-start">
-          <div className="max-w-[88%] rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm leading-6 text-slate-100 md:max-w-[72%]">
+        <div className="flex min-w-0 justify-start">
+          <div className="max-w-[88%] min-w-0 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm leading-6 text-slate-100 md:max-w-[72%]">
             <div className="mb-2 flex items-center gap-2 text-xs font-medium text-emerald-300">
               <span className="spinner" />
               Working
             </div>
-            <div className="whitespace-pre-wrap">{liveText}</div>
+            <div className="wrap-anywhere whitespace-pre-wrap">{liveText}</div>
           </div>
         </div>
       ) : null}
 
-      {waiting ? (
-        <div className="flex justify-start">
-          <div className="inline-flex items-center gap-2 rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-300">
-            <span className="spinner" />
-            {statusLabel(turn.status)}
+      {failed || cancelled ? (
+        <div className="flex min-w-0 justify-start">
+          <div
+            className={`max-w-[88%] min-w-0 rounded-md border px-3 py-2 text-sm leading-6 wrap-anywhere md:max-w-[72%] ${
+              failed
+                ? 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+                : 'border-slate-700 bg-slate-900/60 text-slate-400'
+            }`}
+          >
+            {turn.error ?? statusLabel(turn.status)}
           </div>
         </div>
       ) : null}
+
+      <div className="flex flex-wrap items-center gap-2 px-1 text-[11px] text-slate-500">
+        <TurnStatusDot className="mt-0" status={turn.status} />
+        <span>
+          {turn.cancel_requested && inFlight
+            ? 'Cancelling'
+            : statusLabel(turn.status)}
+        </span>
+        {inFlight ? (
+          <span>{formatElapsed(turn.started_at ?? turn.created_at, now)}</span>
+        ) : null}
+        {turn.commit ? (
+          <span className="font-mono text-slate-600">
+            {turn.commit.slice(0, 7)}
+          </span>
+        ) : null}
+      </div>
     </article>
   )
 }
 
-function EnvelopeBubble({ turn }: { turn: Turn }) {
-  const envelope = turn.envelope
-  const questions = envelope?.questions ?? []
-
-  if (!envelope) {
-    return null
-  }
+function EnvelopeBubble({ envelope }: { envelope: Envelope }) {
+  const questions = envelope.questions ?? []
 
   return (
-    <div className="flex justify-start">
-      <div className="max-w-[88%] rounded-md border border-slate-700 bg-slate-900 px-3 py-3 text-sm leading-6 text-slate-100 shadow-lg shadow-black/20 md:max-w-[72%]">
-        <strong className="block text-base text-white">{envelope.headline}</strong>
+    <div className="flex min-w-0 justify-start">
+      <div className="max-w-[88%] min-w-0 rounded-md border border-slate-700 bg-slate-900 px-3 py-3 text-sm leading-6 text-slate-100 shadow-lg shadow-black/20 md:max-w-[72%]">
+        <strong className="block text-base wrap-anywhere text-white">
+          {envelope.headline}
+        </strong>
         {envelope.body_markdown ? (
-          <div className="markdown mt-3">
+          <div className="markdown mt-3 min-w-0">
             <ReactMarkdown>{envelope.body_markdown}</ReactMarkdown>
           </div>
         ) : null}
@@ -829,11 +1143,11 @@ function EnvelopeBubble({ turn }: { turn: Turn }) {
             <div className="grid gap-3">
               {questions.map((question) => (
                 <div key={question.text}>
-                  <div className="text-sm font-medium text-amber-50">
+                  <div className="text-sm font-medium wrap-anywhere text-amber-50">
                     {question.text}
                   </div>
                   {question.recommendation ? (
-                    <div className="mt-1 text-xs text-amber-100/80">
+                    <div className="mt-1 text-xs wrap-anywhere text-amber-100/80">
                       Recommendation: {question.recommendation}
                     </div>
                   ) : null}
@@ -842,12 +1156,6 @@ function EnvelopeBubble({ turn }: { turn: Turn }) {
             </div>
           </div>
         ) : null}
-
-        <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-500">
-          <span>turn {turn.seq}</span>
-          {turn.commit ? <span>{turn.commit.slice(0, 12)}</span> : null}
-          {turn.finished_at ? <span>{formatDateTime(turn.finished_at)}</span> : null}
-        </div>
       </div>
     </div>
   )
@@ -859,7 +1167,7 @@ function EmptyPane({ onNewSession }: { onNewSession: () => void }) {
       <div className="w-full max-w-sm rounded-md border border-slate-800 bg-slate-950/50 p-4 text-center">
         <h1 className="text-lg font-semibold text-white">No session selected</h1>
         <button
-          className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200"
+          className="mt-4 inline-flex h-11 items-center justify-center gap-2 rounded-md bg-emerald-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-emerald-200"
           onClick={onNewSession}
           type="button"
         >
@@ -873,7 +1181,7 @@ function EmptyPane({ onNewSession }: { onNewSession: () => void }) {
 
 function RunnersStrip({ runners }: { runners: RunnerStatusInfo[] }) {
   return (
-    <footer className="flex min-h-11 items-center gap-2 overflow-x-auto border-t border-slate-800 bg-[#080b10] px-3 py-2">
+    <footer className="order-first flex min-h-11 shrink-0 items-center gap-2 overflow-x-auto border-b border-slate-800 bg-[#080b10] px-3 py-2 md:order-none md:border-t md:border-b-0 md:pb-[calc(0.5rem+env(safe-area-inset-bottom))]">
       {runners.length === 0 ? (
         <span className="rounded-md border border-slate-800 bg-slate-950 px-3 py-1 text-xs text-slate-500">
           No runners
@@ -902,29 +1210,43 @@ function RunnersStrip({ runners }: { runners: RunnerStatusInfo[] }) {
 
 function LaneBadge({ lane }: { lane: Lane }) {
   return (
-    <span className="inline-flex max-w-full items-center rounded-md border border-cyan-300/20 bg-cyan-300/10 px-2 py-0.5 text-xs font-medium text-cyan-100">
-      <span className="truncate">
-        {lane.harness}/{lane.model}
-      </span>
+    <span className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-md border border-cyan-300/20 bg-cyan-300/10 px-1.5 py-0.5 text-[11px] font-medium text-cyan-100">
+      <span className="shrink-0">{vendorForHarness(lane.harness)}</span>
+      <span className="truncate text-cyan-200/70">{lane.model}</span>
     </span>
   )
 }
 
-function RunStateDot({ state }: { state: 'working' | 'queued' | 'idle' }) {
-  const className =
-    state === 'working'
-      ? 'bg-sky-300 shadow-[0_0_0_4px_rgba(125,211,252,0.12)]'
-      : state === 'queued'
-        ? 'bg-amber-300 shadow-[0_0_0_4px_rgba(252,211,77,0.12)]'
-        : 'bg-slate-600'
+function TurnStatusDot({
+  className = 'mt-1',
+  status,
+}: {
+  className?: string
+  status: TurnStatus | null
+}) {
+  const tone = status ? dotClasses[status] : 'bg-slate-700'
+  const label = status ? statusLabel(status) : 'No turns'
 
   return (
     <span
-      aria-label={state}
-      className={`mt-1 inline-block h-2.5 w-2.5 shrink-0 rounded-full ${className}`}
-      title={state}
+      aria-label={label}
+      className={`inline-block h-2.5 w-2.5 shrink-0 rounded-full ${tone} ${className}`}
+      title={label}
     />
   )
+}
+
+/** A clock that re-renders on a tick, so relative times stay honest. */
+function useNow(intervalMs: number) {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMs)
+
+    return () => window.clearInterval(timer)
+  }, [intervalMs])
+
+  return now
 }
 
 function useApi(token: string) {
@@ -1105,22 +1427,173 @@ function errorMessage(error: unknown): string {
   return 'Request failed.'
 }
 
-function sessionRunState(turns: Turn[]): 'working' | 'queued' | 'idle' {
-  const latestTurn = turns.at(-1)
+/** Rows in render order: every root, each followed by its sub-agent subtree. */
+function buildSessionTree(sessions: Session[]): SessionNode[] {
+  const known = new Set(sessions.map((session) => session.id))
+  const children = new Map<SessionId, Session[]>()
+  const roots: Session[] = []
 
-  if (!latestTurn) {
-    return 'idle'
+  for (const session of sessions) {
+    const parentId = session.parent_id
+    const nested =
+      typeof parentId === 'string' &&
+      parentId !== session.id &&
+      known.has(parentId)
+
+    if (nested) {
+      const bucket = children.get(parentId)
+
+      if (bucket) {
+        bucket.push(session)
+      } else {
+        children.set(parentId, [session])
+      }
+    } else {
+      roots.push(session)
+    }
   }
 
-  if (latestTurn.status === 'queued') {
-    return 'queued'
+  const nodes: SessionNode[] = []
+  const placed = new Set<SessionId>()
+
+  const walk = (session: Session, depth: number) => {
+    if (placed.has(session.id)) {
+      return
+    }
+
+    placed.add(session.id)
+    const kids = children.get(session.id) ?? []
+    nodes.push({ childCount: kids.length, depth, session })
+
+    for (const kid of kids) {
+      walk(kid, Math.min(depth + 1, maxTreeDepth))
+    }
   }
 
-  if (latestTurn.status === 'claimed' || latestTurn.status === 'working') {
-    return 'working'
+  for (const root of roots) {
+    walk(root, 0)
   }
 
-  return 'idle'
+  // A parent cycle would otherwise drop rows off the list entirely.
+  for (const session of sessions) {
+    walk(session, 0)
+  }
+
+  return nodes
+}
+
+function parentOf(sessions: Session[], session: Session): Session | null {
+  const parentId = session.parent_id
+
+  if (typeof parentId !== 'string') {
+    return null
+  }
+
+  return sessions.find((item) => item.id === parentId) ?? null
+}
+
+function childrenOf(sessions: Session[], parentId: SessionId): Session[] {
+  return sessions.filter((session) => session.parent_id === parentId)
+}
+
+/** owner/repo, the only part of a clone URL worth a phone header. */
+function shortRepo(url: string | null | undefined): string | null {
+  const trimmed = (url ?? '').trim().replace(/\.git$/, '')
+
+  if (!trimmed) {
+    return null
+  }
+
+  const parts = trimmed.split(/[/:]/).filter(Boolean)
+
+  return parts.length >= 2 ? parts.slice(-2).join('/') : trimmed
+}
+
+function composerNote(error: unknown): ComposerNote {
+  const conflict = error instanceof ApiError && error.status === 409
+
+  return { kind: conflict ? 'notice' : 'error', text: errorMessage(error) }
+}
+
+function formatElapsed(since: string | null | undefined, now: number) {
+  const at = since ? Date.parse(since) : Number.NaN
+
+  if (Number.isNaN(at)) {
+    return ''
+  }
+
+  const seconds = Math.max(0, Math.round((now - at) / 1_000))
+
+  if (seconds < 60) {
+    return `${seconds}s`
+  }
+
+  const minutes = Math.floor(seconds / 60)
+
+  if (minutes < 60) {
+    return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`
+  }
+
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
+}
+
+function latestTurnStatus(turns: Turn[] | undefined): TurnStatus | null {
+  return turns?.at(-1)?.status ?? null
+}
+
+function modelKey(choice: ModelChoice): string {
+  return `${choice.harness}::${choice.model}`
+}
+
+function firstModelKey(models: ModelChoice[]): string | null {
+  const first = models[0]
+  return first ? modelKey(first) : null
+}
+
+/** Vendor groups in the order the caller listed them. */
+function groupModels(models: ModelChoice[]) {
+  const groups: { vendor: string; choices: ModelChoice[] }[] = []
+
+  for (const choice of models) {
+    const group = groups.find((item) => item.vendor === choice.vendor)
+
+    if (group) {
+      group.choices.push(choice)
+    } else {
+      groups.push({ choices: [choice], vendor: choice.vendor })
+    }
+  }
+
+  return groups
+}
+
+function configFromPayload(payload: unknown): CallerConfig {
+  if (!isRecord(payload)) {
+    return emptyConfig
+  }
+
+  return {
+    default_repo_url:
+      typeof payload.default_repo_url === 'string'
+        ? payload.default_repo_url
+        : null,
+    models: collectionFromPayload<ModelChoice>(payload.models, 'models'),
+  }
+}
+
+function vendorForHarness(harness: Harness): string {
+  switch (harness) {
+    case 'claude-code':
+      return 'Anthropic'
+    case 'codex':
+      return 'OpenAI'
+    case 'cursor':
+      return 'Cursor'
+    case 'mock':
+      return 'Mock'
+    default:
+      return harness
+  }
 }
 
 function statusLabel(status: Turn['status']) {
@@ -1137,6 +1610,8 @@ function statusLabel(status: Turn['status']) {
       return 'Error'
     case 'capped':
       return 'Capped'
+    case 'cancelled':
+      return 'Cancelled'
   }
 }
 
@@ -1145,7 +1620,9 @@ function defaultModelForHarness(harness: Harness): string {
     case 'claude-code':
       return 'opus'
     case 'codex':
-      return 'gpt-5'
+      return 'gpt-5.6-sol'
+    case 'cursor':
+      return 'composer-2.5'
     case 'mock':
       return 'mock'
   }
@@ -1157,6 +1634,45 @@ function optionalField<K extends string>(
 ): Partial<Record<K, string>> {
   const trimmed = value.trim()
   return trimmed ? ({ [key]: trimmed } as Partial<Record<K, string>>) : {}
+}
+
+/** Short relative age for a list row: now, 4m, 3h, 2d, then a date. */
+function formatRelative(value: string | null | undefined, now: number) {
+  if (!value) {
+    return 'never'
+  }
+
+  const at = Date.parse(value)
+
+  if (Number.isNaN(at)) {
+    return value
+  }
+
+  const seconds = Math.max(0, Math.round((now - at) / 1_000))
+
+  if (seconds < 45) {
+    return 'now'
+  }
+
+  const minutes = Math.round(seconds / 60)
+
+  if (minutes < 60) {
+    return `${minutes}m`
+  }
+
+  const hours = Math.round(minutes / 60)
+
+  if (hours < 24) {
+    return `${hours}h`
+  }
+
+  const days = Math.round(hours / 24)
+
+  if (days < 7) {
+    return `${days}d`
+  }
+
+  return formatDateTime(value)
 }
 
 function formatDateTime(value: string | null | undefined) {

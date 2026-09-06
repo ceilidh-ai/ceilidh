@@ -49,6 +49,24 @@ export const setRunners = (
   runners: sortRunners(runners),
 })
 
+/** Fold a turn the client fetched directly (create, cancel) into the store. */
+export const applyTurn = (state: ClientState, turn: Turn): ClientState =>
+  turn.status === 'cancelled' || turn.status === 'done'
+    ? removeLiveChunk(upsertTurn(state, turn), turn.id)
+    : upsertTurn(state, turn)
+
+export const upsertSession = (
+  state: ClientState,
+  session: Session,
+): ClientState => ({
+  ...state,
+  sessions: sortSessions(
+    state.sessions.some((item) => item.id === session.id)
+      ? state.sessions.map((item) => (item.id === session.id ? session : item))
+      : [session, ...state.sessions],
+  ),
+})
+
 export const foldEvent = (state: ClientState, event: Event): ClientState => {
   switch (event.type) {
     case 'turn_queued':
@@ -74,6 +92,8 @@ export const foldEvent = (state: ClientState, event: Event): ClientState => {
       }
     case 'turn_done':
       return removeLiveChunk(upsertTurn(state, event.turn), event.turn.id)
+    case 'turn_cancelled':
+      return removeLiveChunk(upsertTurn(state, event.turn), event.turn.id)
     case 'turn_error':
       return removeLiveChunk(
         updateTurn(state, event.turn_id, (turn) => ({
@@ -83,6 +103,8 @@ export const foldEvent = (state: ClientState, event: Event): ClientState => {
         })),
         event.turn_id,
       )
+    case 'session_created':
+      return upsertSession(state, event.session)
     case 'runner_status':
       return upsertRunner(state, event.runner)
   }
