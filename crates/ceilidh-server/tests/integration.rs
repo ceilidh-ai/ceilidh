@@ -5,7 +5,7 @@ use axum::http::{Method, Request, Response, StatusCode};
 use axum::Router;
 use ceilidh_protocol::{
     ClaimRequest, ClaimResponse, CreateSessionRequest, Envelope, Event, Harness, Lane,
-    PostTurnRequest, ReportRequest, RunnerStatusInfo, Session, Turn, TurnStatus,
+    PostTurnRequest, ReportRequest, RunnerStatusInfo, Session, SessionStatus, Turn, TurnStatus,
 };
 use ceilidh_server::{ServeOptions, build_app, build_app_with_web_dir};
 use futures_util::{Stream, StreamExt};
@@ -1128,5 +1128,161 @@ async fn messages_queue_behind_a_running_turn() -> Result<()> {
     assert_eq!(over, StatusCode::CONFLICT);
 
     let _ = first;
+    Ok(())
+}
+
+
+/// Archiving hides a session and cancels what it was waiting on; deleting is
+/// only allowed once archived and takes the sub-agents with it.
+#[tokio::test]
+async fn archive_then_delete_a_session_with_a_child() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-archive-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: None,
+        default_repo_url: None,
+        github_token: None,
+    })
+    .await?;
+
+    let mock = Some(Lane {
+        harness: Harness::Mock,
+        model: "mock".to_string(),
+        effort: None,
+    });
+    let parent: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "parent".to_string(),
+            lane: mock.clone(),
+            profile: None,
+            parent_id: None,
+        },
+    )
+    .await?;
+    let child: Session = send_json(
+        &app,
+        Method::POST,
+        "/api/sessions",
+        None,
+        &CreateSessionRequest {
+            title: "child".to_string(),
+            lane: mock,
+            profile: None,
+            parent_id: Some(parent.id),
+        },
+    )
+    .await?;
+    let queued: Turn = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/turns", child.id),
+        None,
+        &PostTurnRequest {
+            input: "never runs".to_string(),
+            lane: None,
+        },
+    )
+    .await?;
+
+    // Delete before archive is refused.
+    let refused = send_status(
+        &app,
+        Method::DELETE,
+        &format!("/api/sessions/{}", parent.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(refused, StatusCode::CONFLICT);
+
+    let archived: Session = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/archive", parent.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(archived.status, SessionStatus::Archived);
+
+    // The child went with it, and its queued turn was cancelled.
+    let child_now: Session = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{}", child.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(child_now.status, SessionStatus::Archived);
+    let turns: Vec<Turn> = send_json(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{}/turns", child.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(turns[0].id, queued.id);
+    assert_eq!(turns[0].status, TurnStatus::Cancelled);
+
+    // The default list hides both; include=archived shows them.
+    let listed: Vec<Session> = send_json(&app, Method::GET, "/api/sessions", None, &()).await?;
+    assert!(listed.iter().all(|s| s.id != parent.id && s.id != child.id));
+    let all: Vec<Session> = send_json(
+        &app,
+        Method::GET,
+        "/api/sessions?include=archived",
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(all.len(), 2);
+
+    // Unarchive brings the parent back alone.
+    let back: Session = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/unarchive", parent.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(back.status, SessionStatus::Active);
+    let _: Session = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/sessions/{}/archive", parent.id),
+        None,
+        &(),
+    )
+    .await?;
+
+    let deleted = send_status(
+        &app,
+        Method::DELETE,
+        &format!("/api/sessions/{}", parent.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(deleted, StatusCode::NO_CONTENT);
+    let gone = send_status(
+        &app,
+        Method::GET,
+        &format!("/api/sessions/{}", child.id),
+        None,
+        &(),
+    )
+    .await?;
+    assert_eq!(gone, StatusCode::NOT_FOUND, "the child went with the parent");
+
     Ok(())
 }
