@@ -202,6 +202,9 @@ function Workbench({
   const [config, setConfig] = useState<CallerConfig | null>(null)
   const [repos, setRepos] = useState<RepoList>(emptyRepos)
   const [showArchived, setShowArchived] = useState(false)
+  const [selecting, setSelecting] = useState(false)
+  const [picked, setPicked] = useState<Set<SessionId>>(() => new Set())
+  const [archivingPicked, setArchivingPicked] = useState(false)
   const [loadingOverview, setLoadingOverview] = useState(true)
   const [overviewError, setOverviewError] = useState<string | null>(null)
   const [sendingSessionId, setSendingSessionId] = useState<SessionId | null>(
@@ -377,6 +380,49 @@ function Workbench({
     }
   }
 
+  const toggleSelecting = () => {
+    setSelecting((value) => !value)
+    setPicked(new Set())
+  }
+
+  const togglePicked = (sessionId: SessionId) => {
+    setPicked((current) => {
+      const next = new Set(current)
+      if (next.has(sessionId)) {
+        next.delete(sessionId)
+      } else {
+        next.add(sessionId)
+      }
+      return next
+    })
+  }
+
+  // Archive every picked session that is still active. Archiving a parent
+  // already takes its sub-agents, so a picked child under a picked parent
+  // simply comes back as already archived.
+  const archivePicked = async () => {
+    const targets = state.sessions.filter(
+      (session) => picked.has(session.id) && session.status !== 'archived',
+    )
+    if (targets.length === 0) {
+      return
+    }
+    setArchivingPicked(true)
+    try {
+      for (const target of targets) {
+        try {
+          await setSessionArchived(target.id, true)
+        } catch (error) {
+          setOverviewError(errorMessage(error))
+        }
+      }
+      setPicked(new Set())
+      setSelecting(false)
+    } finally {
+      setArchivingPicked(false)
+    }
+  }
+
   const deleteSession = async (sessionId: SessionId) => {
     await apiFetch<void>(`/api/sessions/${sessionId}`, { method: 'DELETE' })
     setState((current) => removeSession(current, sessionId))
@@ -474,7 +520,13 @@ function Workbench({
             onRefresh={refreshOverview}
             onSelect={selectSession}
             archivedCount={archivedCount}
+            archivingPicked={archivingPicked}
+            onArchivePicked={archivePicked}
             onToggleArchived={() => setShowArchived((value) => !value)}
+            onTogglePicked={togglePicked}
+            onToggleSelecting={toggleSelecting}
+            picked={picked}
+            selecting={selecting}
             selectedSessionId={selectedSessionId}
             sessionTurnMap={sessionTurnMap}
             sessions={visibleSessions}
@@ -579,8 +631,14 @@ function TokenScreen({
 
 function SessionsPanel({
   archivedCount,
+  archivingPicked,
   changeTokenLabel,
   loading,
+  onArchivePicked,
+  onTogglePicked,
+  onToggleSelecting,
+  picked,
+  selecting,
   onChangeToken,
   onNewSession,
   onRefresh,
@@ -592,8 +650,14 @@ function SessionsPanel({
   showArchived,
 }: {
   archivedCount: number
+  archivingPicked: boolean
   changeTokenLabel: string
   loading: boolean
+  onArchivePicked: () => Promise<void>
+  onTogglePicked: (sessionId: SessionId) => void
+  onToggleSelecting: () => void
+  picked: Set<SessionId>
+  selecting: boolean
   onChangeToken: () => void
   onToggleArchived: () => void
   showArchived: boolean
@@ -615,6 +679,18 @@ function SessionsPanel({
           <p className="text-xs text-slate-500">ceilidh</p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            aria-pressed={selecting}
+            className={`inline-flex h-11 items-center justify-center rounded-md border px-3 text-sm font-medium transition ${
+              selecting
+                ? 'border-emerald-300 bg-emerald-300/10 text-emerald-100'
+                : 'border-slate-700 bg-slate-900 text-slate-200 hover:border-slate-500'
+            }`}
+            onClick={onToggleSelecting}
+            type="button"
+          >
+            {selecting ? 'Done' : 'Select'}
+          </button>
           <button
             aria-label="Refresh sessions"
             className="inline-flex h-11 min-w-16 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-500"
@@ -647,13 +723,33 @@ function SessionsPanel({
               key={node.session.id}
               node={node}
               now={now}
-              onSelect={onSelect}
-              selected={selectedSessionId === node.session.id}
+              onSelect={selecting ? onTogglePicked : onSelect}
+              picked={selecting ? picked.has(node.session.id) : null}
+              selected={!selecting && selectedSessionId === node.session.id}
               turns={sessionTurnMap[node.session.id]}
             />
           ))}
         </div>
       </div>
+
+      {selecting ? (
+        <div className="flex items-center justify-between gap-3 border-t border-slate-800 bg-slate-950/60 px-4 py-2">
+          <span className="text-sm text-slate-400">
+            {picked.size === 0
+              ? 'Tap sessions to pick them'
+              : `${picked.size} picked`}
+          </span>
+          <button
+            className="inline-flex h-11 items-center justify-center gap-2 rounded-md border border-slate-700 bg-slate-900 px-4 text-sm font-semibold text-slate-100 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={picked.size === 0 || archivingPicked}
+            onClick={() => void onArchivePicked()}
+            type="button"
+          >
+            {archivingPicked ? <span className="spinner" /> : null}
+            Archive {picked.size > 0 ? picked.size : ''}
+          </button>
+        </div>
+      ) : null}
 
       <div className="flex items-center justify-between border-t border-slate-800 px-4 py-2">
         <button
@@ -683,12 +779,15 @@ function SessionRow({
   node,
   now,
   onSelect,
+  picked,
   selected,
   turns,
 }: {
   node: SessionNode
   now: number
   onSelect: (sessionId: SessionId) => void
+  /** null when not in selection mode; otherwise whether this row is picked. */
+  picked: boolean | null
   selected: boolean
   turns: Turn[] | undefined
 }) {
@@ -696,13 +795,26 @@ function SessionRow({
 
   return (
     <button
+      aria-pressed={picked ?? undefined}
       className={`flex min-h-14 w-full items-start gap-2 py-3 pr-4 text-left transition hover:bg-slate-900/80 ${
-        selected ? 'bg-slate-900' : ''
+        selected || picked ? 'bg-slate-900' : ''
       }`}
       onClick={() => onSelect(session.id)}
       style={{ paddingLeft: `${1 + depth * 1.1}rem` }}
       type="button"
     >
+      {picked !== null ? (
+        <span
+          aria-hidden="true"
+          className={`mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded border text-xs ${
+            picked
+              ? 'border-emerald-300 bg-emerald-300 text-slate-950'
+              : 'border-slate-600 text-transparent'
+          }`}
+        >
+          &#10003;
+        </span>
+      ) : null}
       {depth > 0 ? (
         <span aria-hidden="true" className="mt-0.5 text-xs text-slate-600">
           &#9492;
