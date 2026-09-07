@@ -14,10 +14,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ceilidh_protocol::{
     ClaimRequest, ClaimResponse, ClaimedWork, Envelope, Harness, Heartbeat, ReportRequest, Session,
-    TurnControl, TurnId, TurnStatus,
+    SessionId, TurnControl, TurnId, TurnStatus,
 };
 use chrono::Utc;
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, StatusCode};
 use serde::Serialize;
 use tokio::fs;
 use tokio::process::Command;
@@ -32,6 +32,8 @@ const CLAIM_WAIT_SECONDS: u32 = 30;
 const CLAIM_TIMEOUT_SECONDS: u64 = 45;
 const HEARTBEAT_SECONDS: u64 = 30;
 const CANCEL_POLL_SECONDS: u64 = 2;
+const REAP_INTERVAL_SECONDS: u64 = 600;
+const REAP_FIRST_DELAY_SECONDS: u64 = 60;
 const MIN_BACKOFF_SECONDS: u64 = 2;
 const MAX_BACKOFF_SECONDS: u64 = 30;
 
@@ -83,7 +85,8 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
         active_turns.clone(),
     ));
 
-    let workspace_manager = Arc::new(WorkspaceManager::new(opts.data_dir));
+    let workspace_manager = Arc::new(WorkspaceManager::new(opts.data_dir.clone()));
+    tokio::spawn(reap_loop(api.clone(), opts.data_dir.clone()));
     let children = Arc::new(ChildRegistry::default());
     tokio::spawn(shutdown_on_signal(children.clone()));
     let mut backoff = Duration::from_secs(MIN_BACKOFF_SECONDS);
@@ -288,6 +291,39 @@ async fn execute_work(
     Ok(outcome.into_report(commit))
 }
 
+/// A deleted session's workspace is the one thing the caller cannot remove
+/// itself. Every ten minutes the runner asks about each workspace it holds
+/// and drops the ones the caller no longer knows. Archived sessions keep
+/// theirs: they can come back, and an unpushed branch would be lost.
+async fn reap_loop(api: RunnerApi, data_dir: PathBuf) {
+    time::sleep(Duration::from_secs(REAP_FIRST_DELAY_SECONDS)).await;
+    let mut interval = time::interval(Duration::from_secs(REAP_INTERVAL_SECONDS));
+    loop {
+        interval.tick().await;
+        let sessions_dir = data_dir.join("sessions");
+        let Ok(mut entries) = fs::read_dir(&sessions_dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(session_id) = uuid::Uuid::parse_str(&name) else {
+                continue;
+            };
+            match api.session_exists(session_id).await {
+                Ok(false) => {
+                    let path = entry.path();
+                    match fs::remove_dir_all(&path).await {
+                        Ok(()) => info!(session = %session_id, "removed the workspace of a deleted session"),
+                        Err(err) => warn!(session = %session_id, error = %err, "could not remove workspace"),
+                    }
+                }
+                Ok(true) => {}
+                Err(err) => debug!(session = %session_id, error = %err, "reap check failed"),
+            }
+        }
+    }
+}
+
 /// Polls the caller while a turn runs; flips the watch when a cancel lands.
 fn spawn_cancel_watcher(
     api: RunnerApi,
@@ -367,6 +403,22 @@ impl RunnerApi {
         let response = self.send_json(Method::POST, &path, report).await?;
         expect_success(response, "report").await?;
         Ok(())
+    }
+
+    /// Ok(false) only on a definite 404; any other failure is an error, so a
+    /// caller outage never reads as "delete everything".
+    async fn session_exists(&self, session_id: SessionId) -> Result<bool> {
+        let url = format!("{}/api/sessions/{session_id}", self.server_url);
+        let mut request = self.client.get(url);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.context("send session lookup")?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Ok(false),
+            status if status.is_success() => Ok(true),
+            status => bail!("session lookup failed with HTTP {status}"),
+        }
     }
 
     async fn control(&self, turn_id: TurnId) -> Result<TurnControl> {

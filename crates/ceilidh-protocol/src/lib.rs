@@ -198,6 +198,10 @@ pub enum Event {
     TurnCancelled { turn: Turn },
     /// A session appeared (created by a human or spawned as a sub-agent).
     SessionCreated { session: Session },
+    /// A session changed shape (archived, unarchived, retitled).
+    SessionUpdated { session: Session },
+    /// A session and its turns are gone; runners drop its workspace.
+    SessionDeleted { session_id: SessionId },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

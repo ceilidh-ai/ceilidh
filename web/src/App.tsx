@@ -27,6 +27,8 @@ import type {
 } from './protocol'
 import {
   applyTurn,
+  removeSession,
+  upsertSession,
   emptyClientState,
   foldEvent,
   setRunners,
@@ -60,6 +62,8 @@ const eventNames = [
   'turn_error',
   'turn_cancelled',
   'session_created',
+  'session_updated',
+  'session_deleted',
   'runner_status',
 ]
 
@@ -125,6 +129,7 @@ function Workbench({
   const [creating, setCreating] = useState(false)
   const [config, setConfig] = useState<CallerConfig | null>(null)
   const [repos, setRepos] = useState<RepoList>(emptyRepos)
+  const [showArchived, setShowArchived] = useState(false)
   const [loadingOverview, setLoadingOverview] = useState(true)
   const [overviewError, setOverviewError] = useState<string | null>(null)
   const [sendingSessionId, setSendingSessionId] = useState<SessionId | null>(
@@ -178,7 +183,7 @@ function Workbench({
           // through its free-text model path.
           apiFetch<unknown>('/api/config').catch(() => null),
           apiFetch<unknown>('/api/repos').catch(() => null),
-          apiFetch<unknown>('/api/sessions'),
+          apiFetch<unknown>('/api/sessions?include=archived'),
           apiFetch<unknown>('/api/runners'),
         ])
       const sessions = collectionFromPayload<Session>(
@@ -239,6 +244,13 @@ function Workbench({
 
   const selectedSession =
     state.sessions.find((session) => session.id === selectedSessionId) ?? null
+  // Archived sessions stay out of the way unless asked for; a child of a
+  // visible session stays visible so the tree never loses a branch.
+  const visibleSessions = showArchived
+    ? state.sessions
+    : state.sessions.filter((session) => session.status !== 'archived')
+  const archivedCount = state.sessions.length - visibleSessions.length
+
   const selectedTurns = selectedSessionId
     ? state.turnsBySession[selectedSessionId] ?? []
     : []
@@ -278,6 +290,26 @@ function Workbench({
     await refreshOverview()
     setCreating(false)
     setPane('chat')
+  }
+
+  const setSessionArchived = async (sessionId: SessionId, archived: boolean) => {
+    const payload = await apiFetch<unknown>(
+      `/api/sessions/${sessionId}/${archived ? 'archive' : 'unarchive'}`,
+      { method: 'POST' },
+    )
+    const session = singleFromPayload<Session>(payload, 'session')
+    if (session?.id) {
+      setState((current) => upsertSession(current, session))
+    } else {
+      await refreshOverview()
+    }
+  }
+
+  const deleteSession = async (sessionId: SessionId) => {
+    await apiFetch<void>(`/api/sessions/${sessionId}`, { method: 'DELETE' })
+    setState((current) => removeSession(current, sessionId))
+    setSelectedSessionId(null)
+    setPane('sessions')
   }
 
   const cancelTurn = async (sessionId: SessionId, turnId: TurnId) => {
@@ -340,7 +372,9 @@ function Workbench({
     <ChatView
       childSessions={childrenOf(state.sessions, selectedSession.id)}
       liveChunks={state.liveChunks}
+      onArchive={(archived) => setSessionArchived(selectedSession.id, archived)}
       onBack={closeMainPane}
+      onDelete={() => deleteSession(selectedSession.id)}
       onCancel={(turnId) => cancelTurn(selectedSession.id, turnId)}
       onOpenSession={selectSession}
       onSend={(input) => sendTurn(selectedSession.id, input)}
@@ -366,9 +400,12 @@ function Workbench({
             onNewSession={openNewSession}
             onRefresh={refreshOverview}
             onSelect={selectSession}
+            archivedCount={archivedCount}
+            onToggleArchived={() => setShowArchived((value) => !value)}
             selectedSessionId={selectedSessionId}
             sessionTurnMap={sessionTurnMap}
-            sessions={state.sessions}
+            sessions={visibleSessions}
+            showArchived={showArchived}
           />
           {overviewError ? (
             <div className="border-t border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
@@ -448,17 +485,23 @@ function TokenScreen({ onSave }: { onSave: (token: string) => void }) {
 }
 
 function SessionsPanel({
+  archivedCount,
   loading,
   onChangeToken,
   onNewSession,
   onRefresh,
   onSelect,
+  onToggleArchived,
   selectedSessionId,
   sessionTurnMap,
   sessions,
+  showArchived,
 }: {
+  archivedCount: number
   loading: boolean
   onChangeToken: () => void
+  onToggleArchived: () => void
+  showArchived: boolean
   onNewSession: () => void
   onRefresh: () => void
   onSelect: (sessionId: SessionId) => void
@@ -517,7 +560,7 @@ function SessionsPanel({
         </div>
       </div>
 
-      <div className="border-t border-slate-800 px-4 py-2">
+      <div className="flex items-center justify-between border-t border-slate-800 px-4 py-2">
         <button
           className="inline-flex h-11 items-center text-sm font-medium text-slate-400 transition hover:text-slate-100"
           onClick={onChangeToken}
@@ -525,6 +568,17 @@ function SessionsPanel({
         >
           Change token
         </button>
+        {archivedCount > 0 || showArchived ? (
+          <button
+            className="inline-flex h-11 items-center text-sm font-medium text-slate-400 transition hover:text-slate-100"
+            onClick={onToggleArchived}
+            type="button"
+          >
+            {showArchived
+              ? 'Hide archived'
+              : `Show ${archivedCount} archived`}
+          </button>
+        ) : null}
       </div>
     </>
   )
@@ -562,10 +616,20 @@ function SessionRow({
 
       <span className="min-w-0 flex-1">
         <span className="flex items-start justify-between gap-2">
-          <span className="min-w-0 truncate text-sm font-semibold text-slate-100">
+          <span
+            className={`min-w-0 truncate text-sm font-semibold ${
+              session.status === 'archived' ? 'text-slate-500' : 'text-slate-100'
+            }`}
+          >
             {session.title}
           </span>
-          <TurnStatusDot status={latestTurnStatus(turns)} />
+          {session.status === 'archived' ? (
+            <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
+              archived
+            </span>
+          ) : (
+            <TurnStatusDot status={latestTurnStatus(turns)} />
+          )}
         </span>
         <span className="mt-1 flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400">
           <LaneBadge lane={session.lane} />
@@ -901,8 +965,10 @@ function NewSessionForm({
 function ChatView({
   childSessions,
   liveChunks,
+  onArchive,
   onBack,
   onCancel,
+  onDelete,
   onOpenSession,
   onSend,
   parentSession,
@@ -913,8 +979,10 @@ function ChatView({
 }: {
   childSessions: Session[]
   liveChunks: Record<TurnId, string>
+  onArchive: (archived: boolean) => Promise<void>
   onBack: () => void
   onCancel: (turnId: TurnId) => Promise<void>
+  onDelete: () => Promise<void>
   onOpenSession: (sessionId: SessionId) => void
   onSend: (input: string) => Promise<void>
   parentSession: Session | null
@@ -926,7 +994,37 @@ function ChatView({
   const [input, setInput] = useState('')
   const [note, setNote] = useState<ComposerNote | null>(null)
   const [cancelling, setCancelling] = useState(false)
+  const [housekeeping, setHousekeeping] = useState(false)
+  const archived = session.status === 'archived'
   const bottom = useRef<HTMLDivElement | null>(null)
+
+  const housekeep = async (action: () => Promise<void>) => {
+    if (housekeeping) {
+      return
+    }
+    setHousekeeping(true)
+    setNote(null)
+    try {
+      await action()
+    } catch (error) {
+      setNote(composerNote(error))
+    } finally {
+      setHousekeeping(false)
+    }
+  }
+
+  const confirmDelete = () => {
+    const extra =
+      childSessions.length > 0
+        ? ` and its ${childSessions.length} sub-agent session${childSessions.length === 1 ? '' : 's'}`
+        : ''
+    const ok = window.confirm(
+      `Delete "${session.title}"${extra}? The turns and replies go now and the workspace on the seat is removed within ten minutes. Anything pushed stays on its branch.`,
+    )
+    if (ok) {
+      void housekeep(onDelete)
+    }
+  }
   const inFlightTurn = turns.find((turn) => inFlightStatuses.has(turn.status))
   const now = useNow(inFlightTurn ? 1_000 : 60_000)
   const queuedAhead = turns.filter((turn) => turn.status === 'queued').length
@@ -1021,7 +1119,44 @@ function ChatView({
                   </span>
                 </button>
               ) : null}
+              {archived ? (
+                <span className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
+                  archived
+                </span>
+              ) : null}
             </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {archived ? (
+              <>
+                <button
+                  className="inline-flex h-11 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-500 disabled:opacity-60"
+                  disabled={housekeeping}
+                  onClick={() => void housekeep(() => onArchive(false))}
+                  type="button"
+                >
+                  Unarchive
+                </button>
+                <button
+                  className="inline-flex h-11 items-center justify-center rounded-md border border-rose-400/40 bg-rose-500/10 px-3 text-sm font-medium text-rose-100 transition hover:border-rose-300 disabled:opacity-60"
+                  disabled={housekeeping}
+                  onClick={confirmDelete}
+                  type="button"
+                >
+                  Delete
+                </button>
+              </>
+            ) : (
+              <button
+                aria-label="Archive session"
+                className="inline-flex h-11 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-500 disabled:opacity-60"
+                disabled={housekeeping}
+                onClick={() => void housekeep(() => onArchive(true))}
+                type="button"
+              >
+                Archive
+              </button>
+            )}
           </div>
         </div>
       </header>

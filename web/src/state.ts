@@ -67,6 +67,19 @@ export const upsertSession = (
   ),
 })
 
+export const removeSession = (
+  state: ClientState,
+  sessionId: SessionId,
+): ClientState => {
+  const turnsBySession = { ...state.turnsBySession }
+  delete turnsBySession[sessionId]
+  return {
+    ...state,
+    sessions: state.sessions.filter((item) => item.id !== sessionId),
+    turnsBySession,
+  }
+}
+
 export const foldEvent = (state: ClientState, event: Event): ClientState => {
   switch (event.type) {
     case 'turn_queued':
@@ -104,7 +117,10 @@ export const foldEvent = (state: ClientState, event: Event): ClientState => {
         event.turn_id,
       )
     case 'session_created':
+    case 'session_updated':
       return upsertSession(state, event.session)
+    case 'session_deleted':
+      return removeSession(state, event.session_id)
     case 'runner_status':
       return upsertRunner(state, event.runner)
   }

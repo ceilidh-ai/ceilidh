@@ -111,6 +111,8 @@ export type Event =
   | { type: 'turn_error'; turn_id: TurnId; message: string }
   | { type: 'turn_cancelled'; turn: Turn }
   | { type: 'session_created'; session: Session }
+  | { type: 'session_updated'; session: Session }
+  | { type: 'session_deleted'; session_id: SessionId }
   | { type: 'runner_status'; runner: RunnerStatusInfo }
 
 export type RepoChoice = {

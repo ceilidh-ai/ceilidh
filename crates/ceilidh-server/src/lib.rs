@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::header;
 use axum::http::{StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -111,7 +111,9 @@ pub async fn build_app_with_web_dir(
         .route("/config", get(get_config))
         .route("/repos", get(get_repos))
         .route("/sessions", post(create_session).get(list_sessions))
-        .route("/sessions/{id}", get(get_session))
+        .route("/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/sessions/{id}/archive", post(archive_session))
+        .route("/sessions/{id}/unarchive", post(unarchive_session))
         .route(
             "/sessions/{id}/turns",
             post(post_turn).get(list_session_turns),
@@ -398,15 +400,29 @@ async fn create_session(
     Ok((StatusCode::CREATED, Json(session)))
 }
 
-async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session>>, ApiError> {
+#[derive(Debug, Default, Deserialize)]
+struct ListSessionsQuery {
+    /// `archived` to include archived sessions; the default list is active only.
+    #[serde(default)]
+    include: Option<String>,
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<ListSessionsQuery>,
+) -> Result<Json<Vec<Session>>, ApiError> {
+    let include_archived = query.include.as_deref() == Some("archived");
     let rows = sqlx::query(
         r#"
         SELECT id, title, lane_json, profile_json, runner_affinity, status, parent_id,
                created_at, updated_at
         FROM sessions
+        WHERE (? OR status = ?)
         ORDER BY created_at DESC
         "#,
     )
+    .bind(include_archived)
+    .bind(enum_string(&SessionStatus::Active)?)
     .fetch_all(&state.pool)
     .await?;
 
@@ -414,6 +430,196 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
         .map(|row| session_from_row(&row, ""))
         .collect::<Result<Vec<_>, _>>()
         .map(Json)
+}
+
+/// The session plus every descendant, parents before children.
+async fn session_tree(pool: &SqlitePool, root: SessionId) -> Result<Vec<Session>, ApiError> {
+    let mut out = vec![get_session_by_id(pool, root).await?];
+    let mut cursor = 0;
+    while cursor < out.len() {
+        let parent = out[cursor].id;
+        let rows = sqlx::query(
+            r#"
+            SELECT id, title, lane_json, profile_json, runner_affinity, status, parent_id,
+                   created_at, updated_at
+            FROM sessions
+            WHERE parent_id = ?
+            ORDER BY created_at ASC
+            "#,
+        )
+        .bind(parent.to_string())
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            out.push(session_from_row(&row, "")?);
+        }
+        cursor += 1;
+    }
+    Ok(out)
+}
+
+async fn set_session_status(
+    state: &AppState,
+    session: &Session,
+    status: SessionStatus,
+) -> Result<Session, ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE sessions
+        SET status = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(enum_string(&status)?)
+    .bind(dt_string(Utc::now()))
+    .bind(session.id.to_string())
+    .execute(&state.pool)
+    .await?;
+    let updated = get_session_by_id(&state.pool, session.id).await?;
+    state.emit(
+        updated.parent_id,
+        Event::SessionUpdated {
+            session: updated.clone(),
+        },
+    );
+    Ok(updated)
+}
+
+/// Archive a session and every sub-agent under it. Queued turns are
+/// cancelled outright; a turn a runner is playing gets a cancel request and
+/// finishes as cancelled when the runner sees it. Nothing is deleted: the
+/// turns, the replies, and the workspace on the seat all stay, and the
+/// session can be unarchived.
+async fn archive_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<SessionId>,
+) -> Result<Json<Session>, ApiError> {
+    let tree = session_tree(&state.pool, id).await?;
+    let now = Utc::now();
+    let mut root = None;
+    for session in &tree {
+        let queued = sqlx::query(
+            r#"
+            SELECT id FROM turns
+            WHERE session_id = ? AND status = ?
+            "#,
+        )
+        .bind(session.id.to_string())
+        .bind(enum_string(&TurnStatus::Queued)?)
+        .fetch_all(&state.pool)
+        .await?;
+        for row in queued {
+            let raw: String = row.try_get("id")?;
+            sqlx::query(
+                r#"
+                UPDATE turns
+                SET status = ?, cancel_requested_at = COALESCE(cancel_requested_at, ?), finished_at = ?
+                WHERE id = ? AND status = ?
+                "#,
+            )
+            .bind(enum_string(&TurnStatus::Cancelled)?)
+            .bind(dt_string(now))
+            .bind(dt_string(now))
+            .bind(&raw)
+            .bind(enum_string(&TurnStatus::Queued)?)
+            .execute(&state.pool)
+            .await?;
+            if let Ok(turn_id) = Uuid::parse_str(&raw) {
+                if let Ok(turn) = get_turn_by_id(&state.pool, turn_id).await {
+                    state.emit(Some(session.id), Event::TurnCancelled { turn });
+                }
+            }
+        }
+        sqlx::query(
+            r#"
+            UPDATE turns
+            SET cancel_requested_at = COALESCE(cancel_requested_at, ?)
+            WHERE session_id = ? AND status IN (?, ?)
+            "#,
+        )
+        .bind(dt_string(now))
+        .bind(session.id.to_string())
+        .bind(enum_string(&TurnStatus::Claimed)?)
+        .bind(enum_string(&TurnStatus::Working)?)
+        .execute(&state.pool)
+        .await?;
+
+        let updated = if session.status == SessionStatus::Archived {
+            session.clone()
+        } else {
+            set_session_status(&state, session, SessionStatus::Archived).await?
+        };
+        if updated.id == id {
+            root = Some(updated);
+        }
+    }
+    state.notify.notify_waiters();
+    root.map(Json).ok_or_else(|| ApiError::not_found("session"))
+}
+
+/// Bring one session back. Its sub-agents stay as they are.
+async fn unarchive_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<SessionId>,
+) -> Result<Json<Session>, ApiError> {
+    let session = get_session_by_id(&state.pool, id).await?;
+    if session.status == SessionStatus::Active {
+        return Ok(Json(session));
+    }
+    let updated = set_session_status(&state, &session, SessionStatus::Active).await?;
+    state.notify.notify_waiters();
+    Ok(Json(updated))
+}
+
+/// Delete an archived session and every sub-agent under it: the rows and
+/// their turns go now, and each runner removes the workspace on its next
+/// sweep. Anything the session pushed is still on its branch at the remote.
+async fn delete_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<SessionId>,
+) -> Result<StatusCode, ApiError> {
+    let tree = session_tree(&state.pool, id).await?;
+    if tree[0].status != SessionStatus::Archived {
+        return Err(ApiError::conflict("archive the session before deleting it"));
+    }
+    for session in &tree {
+        let running: i64 = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS count FROM turns
+            WHERE session_id = ? AND status IN (?, ?)
+            "#,
+        )
+        .bind(session.id.to_string())
+        .bind(enum_string(&TurnStatus::Claimed)?)
+        .bind(enum_string(&TurnStatus::Working)?)
+        .fetch_one(&state.pool)
+        .await?
+        .try_get("count")?;
+        if running > 0 {
+            return Err(ApiError::conflict(format!(
+                "a turn is still running in {}; wait for the cancel to land",
+                session.title
+            )));
+        }
+    }
+    // Children first, so no row ever points at a parent that is gone.
+    for session in tree.iter().rev() {
+        sqlx::query("DELETE FROM turns WHERE session_id = ?")
+            .bind(session.id.to_string())
+            .execute(&state.pool)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(session.id.to_string())
+            .execute(&state.pool)
+            .await?;
+        state.emit(
+            session.parent_id,
+            Event::SessionDeleted {
+                session_id: session.id,
+            },
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_session(
