@@ -83,6 +83,23 @@ names the lanes this installation actually has. That is not cosmetic: a harness
 asked to pass through a model name it has never heard of will otherwise refuse
 the call as fabricated.
 
+## Signing in
+
+The bearer token is a machine credential: runners and the sub-agent MCP
+present it. Browsers sign in with Google when the caller has
+`CEILIDH_GOOGLE_CLIENT_ID`, `CEILIDH_GOOGLE_CLIENT_SECRET`,
+`CEILIDH_PUBLIC_URL` and `CEILIDH_ALLOWED_EMAILS` (comma-separated). The
+flow is the plain OpenID Connect code exchange: `/auth/login` sends the
+browser to Google with a signed state cookie, `/auth/callback` trades the
+code for tokens over TLS, asks Google's userinfo endpoint for the verified
+email, checks the allowlist, and sets a signed `ceilidh_session` cookie
+(HttpOnly, Secure, SameSite=Lax, 30 days). The cookie is accepted wherever
+the token is, including the SSE streams, so a signed-in browser never puts
+the token in a URL. `/auth/config` tells the client whether Google is on;
+without it the token screen is what you get. The cookie key defaults to the
+bearer token, so rotating the token signs every browser out; set
+`CEILIDH_COOKIE_SECRET` to decouple them.
+
 ## Choosing a repository
 
 A session's repository is a per-session field with a configurable default

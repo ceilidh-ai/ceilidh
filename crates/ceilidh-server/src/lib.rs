@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::http::HeaderMap;
+use axum::response::Redirect;
 use axum::http::header;
 use axum::http::{StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -18,6 +20,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::response::{Html, IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+mod auth;
 mod repos;
 
 use ceilidh_protocol::{
@@ -65,7 +68,14 @@ pub struct ServeOptions {
     /// Read-only GitHub token used to offer the repository picker. Absent
     /// means the client falls back to a free-text repository field.
     pub github_token: Option<String>,
+    /// Sign in with Google for the browser; None keeps the token screen.
+    pub google: Option<auth::GoogleAuth>,
+    /// Key for the login cookies; defaults to the bearer token, so rotating
+    /// the token signs every browser out.
+    pub cookie_secret: Option<String>,
 }
+
+pub use auth::GoogleAuth;
 
 pub async fn serve(opts: ServeOptions) -> anyhow::Result<()> {
     serve_with_web_dir(opts, None).await
@@ -95,6 +105,7 @@ pub async fn build_app_with_web_dir(
     sqlx::migrate!("./migrations").run(&pool).await?;
 
     let (events, _) = broadcast::channel(1024);
+    let token_for_cookies = opts.token.clone().filter(|token| !token.is_empty());
     let state = AppState {
         pool,
         events,
@@ -105,11 +116,24 @@ pub async fn build_app_with_web_dir(
             models: model_menu(),
         }),
         repos: repos::RepoCatalog::new(opts.github_token),
+        signer: auth::CookieSigner::new(
+            opts.cookie_secret
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or(token_for_cookies.as_deref())
+                .unwrap_or("ceilidh-loopback"),
+        ),
+        google: opts.google.map(Arc::new),
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_default(),
     };
 
     let api = Router::new()
         .route("/config", get(get_config))
         .route("/repos", get(get_repos))
+        .route("/me", get(auth_me))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/archive", post(archive_session))
@@ -133,8 +157,16 @@ pub async fn build_app_with_web_dir(
         ))
         .with_state(state.clone());
 
+    let auth_routes = Router::new()
+        .route("/auth/config", get(auth_config))
+        .route("/auth/login", get(auth_login))
+        .route("/auth/callback", get(auth_callback))
+        .route("/auth/logout", post(auth_logout))
+        .with_state(state.clone());
+
     let app = Router::new()
         .route("/health", get(health))
+        .merge(auth_routes)
         .nest("/api", api)
         .with_state(state);
 
@@ -154,6 +186,9 @@ struct AppState {
     token: Option<Arc<str>>,
     config: Arc<CallerConfig>,
     repos: repos::RepoCatalog,
+    signer: auth::CookieSigner,
+    google: Option<Arc<auth::GoogleAuth>>,
+    http: reqwest::Client,
 }
 
 /// The model menu the UI offers, grouped by vendor. Every row is a string
@@ -310,7 +345,12 @@ async fn require_auth(
     next: Next,
 ) -> Result<Response, ApiError> {
     match state.token.as_deref() {
-        Some(token) if !request_has_token(&req, token) => Err(ApiError::unauthorized()),
+        Some(token)
+            if !request_has_token(&req, token)
+                && signed_in_email(req.headers(), &state.signer).is_none() =>
+        {
+            Err(ApiError::unauthorized())
+        }
         _ => Ok(next.run(req).await),
     }
 }
@@ -336,6 +376,128 @@ fn query_token_matches(uri: &Uri, token: &str) -> bool {
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+fn signed_in_email(headers: &HeaderMap, signer: &auth::CookieSigner) -> Option<String> {
+    let header = headers.get(header::COOKIE)?.to_str().ok()?;
+    let value = auth::cookie_value(header, auth::SESSION_COOKIE)?;
+    signer.verify("session", value)
+}
+
+/// Whether the browser can sign in with Google; the client picks its login
+/// screen from this.
+async fn auth_config(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "google": state.google.is_some() }))
+}
+
+async fn auth_login(State(state): State<AppState>) -> Response {
+    let Some(google) = state.google.as_ref() else {
+        return ApiError::not_found("google sign-in").into_response();
+    };
+    let nonce = auth::random_token();
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = auth::state_cookie(&state.signer, &nonce).parse() {
+        headers.insert(header::SET_COOKIE, value);
+    }
+    (headers, Redirect::to(&google.authorize_url(&nonce))).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CallbackQuery {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+async fn auth_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let Some(google) = state.google.as_ref() else {
+        return ApiError::not_found("google sign-in").into_response();
+    };
+    let refuse = |why: &str| {
+        (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            format!(
+                "<!doctype html><title>ceilidh</title><main style=\"font-family:system-ui;padding:2rem\"><h1>Not signed in</h1><p>{why}</p><p><a href=\"/\">Back</a></p></main>"
+            ),
+        )
+            .into_response()
+    };
+
+    if let Some(error) = query.error {
+        return refuse(&format!("Google said: {}", html_escape(&error)));
+    }
+    let (Some(code), Some(returned_state)) = (query.code, query.state) else {
+        return refuse("The sign-in reply was incomplete. Try again.");
+    };
+    let expected = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| auth::cookie_value(h, auth::STATE_COOKIE))
+        .and_then(|v| state.signer.verify("state", v));
+    if expected.as_deref() != Some(returned_state.as_str()) {
+        return refuse("The sign-in did not start from this browser. Try again.");
+    }
+
+    let info = match auth::exchange_code(&state.http, google, &code).await {
+        Ok(info) => info,
+        Err(err) => {
+            tracing::warn!(error = %err, "google code exchange failed");
+            return refuse("Google did not confirm the sign-in. Try again.");
+        }
+    };
+    let Some(email) = info.email.filter(|_| info.email_verified) else {
+        return refuse("Google did not return a verified email address.");
+    };
+    if !google.allows(&email) {
+        tracing::warn!(email = %email, "sign-in refused: not on the allowlist");
+        return refuse(&format!(
+            "{} is not allowed in here.",
+            html_escape(&email)
+        ));
+    }
+
+    tracing::info!(email = %email, "signed in with google");
+    let mut out = HeaderMap::new();
+    if let Ok(value) = auth::session_cookie(&state.signer, &email).parse() {
+        out.append(header::SET_COOKIE, value);
+    }
+    if let Ok(value) = auth::clear_cookie(auth::STATE_COOKIE, "/auth").parse() {
+        out.append(header::SET_COOKIE, value);
+    }
+    (out, Redirect::to("/")).into_response()
+}
+
+async fn auth_logout() -> Response {
+    let mut out = HeaderMap::new();
+    if let Ok(value) = auth::clear_cookie(auth::SESSION_COOKIE, "/").parse() {
+        out.insert(header::SET_COOKIE, value);
+    }
+    (StatusCode::NO_CONTENT, out).into_response()
+}
+
+/// Who the caller thinks is asking: the signed-in email, or the machine
+/// token. Behind the auth middleware, so an anonymous request is a 401.
+async fn auth_me(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    match signed_in_email(&headers, &state.signer) {
+        Some(email) => Json(json!({ "email": email, "via": "google" })),
+        None => Json(json!({ "email": null, "via": "token" })),
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn placeholder() -> Html<&'static str> {
@@ -1781,4 +1943,19 @@ fn parse_uuid(value: String) -> Result<Uuid, ApiError> {
 #[derive(Debug, Deserialize)]
 struct ChunkRequest {
     text: String,
+}
+
+
+/// Helpers for integration tests that need a genuine login cookie.
+pub mod test_support {
+    pub use crate::auth::CookieSigner;
+
+    pub fn signer(secret: &str) -> CookieSigner {
+        CookieSigner::new(secret)
+    }
+
+    /// The bare cookie value (no attributes) a signed-in browser would send.
+    pub fn session_cookie_value(signer: &CookieSigner, email: &str) -> String {
+        signer.sign("session", email, 3600)
+    }
 }

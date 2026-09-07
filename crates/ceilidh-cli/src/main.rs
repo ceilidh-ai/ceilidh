@@ -109,6 +109,32 @@ struct ServeArgs {
     /// picker instead of a free-text field (env: CEILIDH_GITHUB_TOKEN)
     #[arg(long, env = "CEILIDH_GITHUB_TOKEN")]
     github_token: Option<String>,
+    /// Google OAuth client id; with the secret, the public URL and an
+    /// allowlist, the browser signs in with Google instead of the token
+    #[arg(long, env = "CEILIDH_GOOGLE_CLIENT_ID")]
+    google_client_id: Option<String>,
+    #[arg(long, env = "CEILIDH_GOOGLE_CLIENT_SECRET", hide_env_values = true)]
+    google_client_secret: Option<String>,
+    /// Where browsers reach this caller, e.g. https://ceilidh.example
+    #[arg(long, env = "CEILIDH_PUBLIC_URL")]
+    public_url: Option<String>,
+    /// Comma-separated emails allowed to sign in
+    #[arg(long, env = "CEILIDH_ALLOWED_EMAILS")]
+    allowed_emails: Option<String>,
+    /// Key for the login cookies; defaults to the bearer token
+    #[arg(long, env = "CEILIDH_COOKIE_SECRET", hide_env_values = true)]
+    cookie_secret: Option<String>,
+}
+
+impl ServeArgs {
+    fn google(&self) -> Option<ceilidh_server::GoogleAuth> {
+        ceilidh_server::GoogleAuth::from_env_values(
+            self.google_client_id.clone(),
+            self.google_client_secret.clone(),
+            self.public_url.clone(),
+            self.allowed_emails.clone(),
+        )
+    }
 }
 
 #[derive(clap::Args)]
@@ -182,11 +208,15 @@ async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Serve(a) => {
             guard_exposed_bind(a.bind, a.token.as_ref())?;
+            let google = a.google();
+            let cookie_secret = a.cookie_secret.clone();
             let web_dir = resolve_web_dir(a.web_dir);
             ceilidh_server::serve_with_web_dir(
                 ceilidh_server::ServeOptions {
                     bind: a.bind,
                     db_path: a.db,
+                    google,
+                    cookie_secret,
                     token: a.token,
                     default_repo_url: a.default_repo,
                     github_token: a.github_token,
@@ -219,12 +249,15 @@ async fn main() -> Result<()> {
         Cmd::Up(a) => {
             guard_exposed_bind(a.serve.bind, a.serve.token.as_ref())?;
             let web_dir = resolve_web_dir(a.serve.web_dir.clone());
+            let google = a.serve.google();
             let serve_opts = ceilidh_server::ServeOptions {
                 bind: a.serve.bind,
                 db_path: a.serve.db,
                 token: a.serve.token.clone(),
                 default_repo_url: a.serve.default_repo.clone(),
                 github_token: a.serve.github_token.clone(),
+                google,
+                cookie_secret: a.serve.cookie_secret.clone(),
             };
 
             let mut harnesses: Vec<ceilidh_protocol::Harness> =
