@@ -63,3 +63,11 @@ cargo test --workspace
 (cd web && npm install && npm run build)
 bash scripts/smoke.sh
 ```
+
+## Configuration
+
+The caller reads `CEILIDH_TOKEN` (the machine credential runners and the
+sub-agent MCP present), `CEILIDH_DEFAULT_REPO` (prefilled into the
+new-session form), `CEILIDH_GITHUB_TOKEN` (one or more read-only GitHub
+tokens, comma-separated, that turn the repository field into a picker), and
+the Google sign-in set described in `docs/ARCHITECTURE.md`.

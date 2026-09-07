@@ -103,8 +103,10 @@ bearer token, so rotating the token signs every browser out; set
 ## Choosing a repository
 
 A session's repository is a per-session field with a configurable default
-(`CEILIDH_DEFAULT_REPO`). When the caller has a read-only GitHub token
-(`CEILIDH_GITHUB_TOKEN`), `GET /api/repos` returns every repository the
+(`CEILIDH_DEFAULT_REPO`). When the caller has one or more read-only GitHub
+tokens (`CEILIDH_GITHUB_TOKEN`, comma-separated; a fine-grained token
+covers one resource owner, so it is one token per account or org, merged
+here), `GET /api/repos` returns every repository the
 operator can reach, grouped by owner, most recently pushed first, cached for
 five minutes; the new-session form renders it as two dropdowns with a
 free-text escape hatch. With no token the endpoint reports itself unavailable
