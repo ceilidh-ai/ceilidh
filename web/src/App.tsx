@@ -93,32 +93,104 @@ class ApiError extends Error {
   }
 }
 
+type Entry =
+  | { kind: 'checking' }
+  | { kind: 'cookie'; email: string }
+  | { kind: 'token'; token: string; google: boolean }
+  | { kind: 'login'; google: boolean }
+
+/** A login cookie wins; then a stored token; then the login screen, which
+ * offers Google when the caller has it and the token field either way. */
 function App() {
-  const [token, setToken] = useState(readStoredToken)
+  const [entry, setEntry] = useState<Entry>({ kind: 'checking' })
+
+  useEffect(() => {
+    let cancelled = false
+    const decide = async () => {
+      const me = await fetch('/api/me', { credentials: 'same-origin' }).catch(
+        () => null,
+      )
+      if (me?.ok) {
+        const body = (await me.json().catch(() => null)) as {
+          email?: string | null
+        } | null
+        if (body?.email) {
+          if (!cancelled) {
+            setEntry({ kind: 'cookie', email: body.email })
+          }
+          return
+        }
+      }
+      const config = await fetch('/auth/config').catch(() => null)
+      const google: boolean = Boolean(
+        config?.ok &&
+          ((await config.json().catch(() => null)) as {
+            google?: boolean
+          } | null)?.google === true,
+      )
+      const token = readStoredToken()
+      if (!cancelled) {
+        setEntry(
+          token ? { kind: 'token', token, google } : { kind: 'login', google },
+        )
+      }
+    }
+    void decide()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const saveToken = (nextToken: string) => {
     window.localStorage.setItem(tokenStorageKey, nextToken)
-    setToken(nextToken)
+    setEntry({ kind: 'token', token: nextToken, google: false })
   }
 
-  const resetToken = () => {
+  const signOut = async () => {
     window.localStorage.removeItem(tokenStorageKey)
-    setToken('')
+    await fetch('/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+    }).catch(() => null)
+    window.location.reload()
   }
 
-  if (!token) {
-    return <TokenScreen onSave={saveToken} />
+  switch (entry.kind) {
+    case 'checking':
+      return (
+        <main className="flex min-h-svh items-center justify-center bg-[#080b10]">
+          <span className="spinner" />
+        </main>
+      )
+    case 'login':
+      return <TokenScreen google={entry.google} onSave={saveToken} />
+    case 'token':
+      return (
+        <Workbench
+          onResetToken={signOut}
+          signOutLabel="Change token"
+          token={entry.token}
+        />
+      )
+    case 'cookie':
+      return (
+        <Workbench
+          onResetToken={signOut}
+          signOutLabel={`Sign out ${entry.email}`}
+          token=""
+        />
+      )
   }
-
-  return <Workbench token={token} onResetToken={resetToken} />
 }
 
 function Workbench({
   token,
   onResetToken,
+  signOutLabel,
 }: {
   token: string
   onResetToken: () => void
+  signOutLabel: string
 }) {
   const apiFetch = useApi(token)
   const [state, setState] = useState<ClientState>(() => emptyClientState())
@@ -397,6 +469,7 @@ function Workbench({
           <SessionsPanel
             loading={loadingOverview}
             onChangeToken={onResetToken}
+            changeTokenLabel={signOutLabel}
             onNewSession={openNewSession}
             onRefresh={refreshOverview}
             onSelect={selectSession}
@@ -425,7 +498,13 @@ function Workbench({
   )
 }
 
-function TokenScreen({ onSave }: { onSave: (token: string) => void }) {
+function TokenScreen({
+  google,
+  onSave,
+}: {
+  google: boolean
+  onSave: (token: string) => void
+}) {
   const [value, setValue] = useState('')
   const [error, setError] = useState<string | null>(null)
 
@@ -452,9 +531,23 @@ function TokenScreen({ onSave }: { onSave: (token: string) => void }) {
             ceilidh
           </p>
           <h1 className="mt-2 text-2xl font-semibold text-white">
-            Bearer token
+            {google ? 'Sign in' : 'Bearer token'}
           </h1>
         </div>
+
+        {google ? (
+          <>
+            <a
+              className="inline-flex h-11 w-full items-center justify-center rounded-md bg-white px-4 text-sm font-semibold text-slate-900 transition hover:bg-slate-200"
+              href="/auth/login"
+            >
+              Sign in with Google
+            </a>
+            <p className="mt-5 text-xs uppercase tracking-wide text-slate-500">
+              or use a token
+            </p>
+          </>
+        ) : null}
 
         <label className="block text-sm font-medium text-slate-300">
           Token
@@ -486,6 +579,7 @@ function TokenScreen({ onSave }: { onSave: (token: string) => void }) {
 
 function SessionsPanel({
   archivedCount,
+  changeTokenLabel,
   loading,
   onChangeToken,
   onNewSession,
@@ -498,6 +592,7 @@ function SessionsPanel({
   showArchived,
 }: {
   archivedCount: number
+  changeTokenLabel: string
   loading: boolean
   onChangeToken: () => void
   onToggleArchived: () => void
@@ -566,7 +661,7 @@ function SessionsPanel({
           onClick={onChangeToken}
           type="button"
         >
-          Change token
+          {changeTokenLabel}
         </button>
         {archivedCount > 0 || showArchived ? (
           <button
@@ -1471,11 +1566,14 @@ function useApi(token: string) {
   return useCallback(
     async <T,>(path: string, init: ApiRequestInit = {}): Promise<T> => {
       const headers = new Headers(init.headers)
-      headers.set('Authorization', `Bearer ${token}`)
+      if (token) {
+        headers.set('Authorization', `Bearer ${token}`)
+      }
 
       const request: RequestInit = {
         ...init,
         headers,
+        credentials: 'same-origin',
       }
 
       if (init.json !== undefined) {
@@ -1565,7 +1663,9 @@ function useEventSource(url: string | null, onEvent: (event: Event) => void) {
 }
 
 function eventUrl(path: string, token: string) {
-  return `${path}?token=${encodeURIComponent(token)}`
+  // Signed in with a cookie, the browser sends it on the stream too, so the
+  // token never has to ride in a URL.
+  return token ? `${path}?token=${encodeURIComponent(token)}` : path
 }
 
 function parseEvent(data: string): Event | null {

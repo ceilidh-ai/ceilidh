@@ -25,6 +25,8 @@ async fn runner_flow_emits_sse_and_persists_final_state() -> Result<()> {
         token: Some("secret".to_string()),
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -217,6 +219,8 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -241,6 +245,8 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
             token: None,
             default_repo_url: None,
             github_token: None,
+        google: None,
+        cookie_secret: None,
         },
         Some(web_dir.clone()),
     )
@@ -410,6 +416,8 @@ async fn claim_carries_forward_the_previous_resume_token() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -518,6 +526,8 @@ async fn stale_in_flight_turns_are_requeued_for_another_runner() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -618,6 +628,8 @@ async fn heartbeat_releases_turns_the_runner_no_longer_holds() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -764,6 +776,8 @@ async fn runner_epochs_separate_a_restart_from_an_orphan() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -916,6 +930,8 @@ async fn a_session_never_has_two_turns_claimed_at_once() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -1021,6 +1037,8 @@ async fn messages_queue_behind_a_running_turn() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -1145,6 +1163,8 @@ async fn archive_then_delete_a_session_with_a_child() -> Result<()> {
         token: None,
         default_repo_url: None,
         github_token: None,
+        google: None,
+        cookie_secret: None,
     })
     .await?;
 
@@ -1283,6 +1303,78 @@ async fn archive_then_delete_a_session_with_a_child() -> Result<()> {
     )
     .await?;
     assert_eq!(gone, StatusCode::NOT_FOUND, "the child went with the parent");
+
+    Ok(())
+}
+
+
+/// The browser signs in with a cookie; the machine token keeps working; an
+/// anonymous request is still refused.
+#[tokio::test]
+async fn a_login_cookie_is_as_good_as_the_token() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-cookie-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: Some("machine".to_string()),
+        default_repo_url: None,
+        github_token: None,
+        google: None,
+        cookie_secret: Some("cookie-key".to_string()),
+    })
+    .await?;
+
+    // No Google configured: the client is told so, without auth.
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/auth/config", None, Body::empty())?)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = decode_json(response).await?;
+    assert_eq!(body["google"], serde_json::Value::Bool(false));
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/auth/login", None, Body::empty())?)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Anonymous: refused. Token: fine. Cookie signed with the right key: fine.
+    let anonymous = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/sessions", None, Body::empty())?)
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let with_token = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/me", Some("machine"), Body::empty())?)
+        .await
+        .unwrap();
+    assert_eq!(with_token.status(), StatusCode::OK);
+    let me: serde_json::Value = decode_json(with_token).await?;
+    assert_eq!(me["via"], "token");
+
+    let signer = ceilidh_server::test_support::signer("cookie-key");
+    let cookie = ceilidh_server::test_support::session_cookie_value(&signer, "someone@example.com");
+    let mut req = request(Method::GET, "/api/me", None, Body::empty())?;
+    req.headers_mut().insert(header::COOKIE, format!("ceilidh_session={cookie}").parse()?);
+    let with_cookie = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(with_cookie.status(), StatusCode::OK);
+    let me: serde_json::Value = decode_json(with_cookie).await?;
+    assert_eq!(me["email"], "someone@example.com");
+
+    let forged = ceilidh_server::test_support::session_cookie_value(
+        &ceilidh_server::test_support::signer("wrong-key"),
+        "someone@example.com",
+    );
+    let mut req = request(Method::GET, "/api/me", None, Body::empty())?;
+    req.headers_mut().insert(header::COOKIE, format!("ceilidh_session={forged}").parse()?);
+    let refused = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
 
     Ok(())
 }
