@@ -3,6 +3,11 @@
 //!
 //! GitHub is asked once and the answer is cached, because the list changes on
 //! the timescale of a working day and the new-session form is opened often.
+//!
+//! Several tokens may be configured (comma-separated), because a fine-grained
+//! token belongs to one resource owner: the operator's own account, or one
+//! org. One token per owner keeps every grant read-only and minimal, and the
+//! lists are merged here.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +24,7 @@ const USER_AGENT: &str = "ceilidh";
 
 #[derive(Debug, Clone)]
 pub struct RepoCatalog {
-    token: Option<Arc<str>>,
+    tokens: Vec<Arc<str>>,
     client: reqwest::Client,
     cache: Arc<Mutex<Option<(Instant, RepoList)>>>,
 }
@@ -45,8 +50,15 @@ struct GhOwner {
 
 impl RepoCatalog {
     pub fn new(token: Option<String>) -> Self {
+        let tokens = token
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(Arc::from)
+            .collect();
         Self {
-            token: token.filter(|t| !t.trim().is_empty()).map(Arc::from),
+            tokens,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
@@ -56,13 +68,13 @@ impl RepoCatalog {
     }
 
     pub async fn list(&self) -> RepoList {
-        let Some(token) = self.token.clone() else {
+        if self.tokens.is_empty() {
             return RepoList {
                 owners: Vec::new(),
                 available: false,
                 error: None,
             };
-        };
+        }
 
         {
             let cache = self.cache.lock().await;
@@ -73,17 +85,29 @@ impl RepoCatalog {
             }
         }
 
-        let list = match self.fetch(&token).await {
-            Ok(owners) => RepoList {
-                owners,
-                available: true,
-                error: None,
-            },
-            Err(err) => RepoList {
+        // Every token contributes what it can see; one failing token loses
+        // only its own owners, and only when all of them fail is the picker
+        // unavailable.
+        let mut repos: Vec<GhRepo> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for token in &self.tokens {
+            match self.fetch(token).await {
+                Ok(found) => repos.extend(found),
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+        let list = if repos.is_empty() && !errors.is_empty() {
+            RepoList {
                 owners: Vec::new(),
                 available: false,
-                error: Some(err.to_string()),
-            },
+                error: Some(errors.join("; ")),
+            }
+        } else {
+            RepoList {
+                owners: group_by_owner(repos),
+                available: true,
+                error: (!errors.is_empty()).then(|| errors.join("; ")),
+            }
         };
 
         if list.available {
@@ -92,7 +116,7 @@ impl RepoCatalog {
         list
     }
 
-    async fn fetch(&self, token: &str) -> anyhow::Result<Vec<RepoOwner>> {
+    async fn fetch(&self, token: &str) -> anyhow::Result<Vec<GhRepo>> {
         let mut repos: Vec<GhRepo> = Vec::new();
         for page in 1..=MAX_PAGES {
             let url = format!(
@@ -118,13 +142,17 @@ impl RepoCatalog {
             }
         }
 
-        Ok(group_by_owner(repos))
+        Ok(repos)
     }
 }
 
 fn group_by_owner(repos: Vec<GhRepo>) -> Vec<RepoOwner> {
     let mut owners: Vec<RepoOwner> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for repo in repos.into_iter().filter(|r| !r.archived) {
+        if !seen.insert(repo.full_name.clone()) {
+            continue;
+        }
         let choice = RepoChoice {
             full_name: repo.full_name,
             owner: repo.owner.login.clone(),
@@ -194,6 +222,22 @@ mod tests {
             vec!["fresh", "stale"]
         );
         assert_eq!(owners[1].repos[0].name, "newer");
+    }
+
+    #[test]
+    fn a_repository_two_tokens_both_see_appears_once() {
+        let owners = group_by_owner(vec![
+            repo("org", "shared", 100, false),
+            repo("org", "shared", 100, false),
+        ]);
+        assert_eq!(owners[0].repos.len(), 1);
+    }
+
+    #[test]
+    fn several_tokens_are_split_on_commas() {
+        let catalog = RepoCatalog::new(Some(" one , two,,".into()));
+        assert_eq!(catalog.tokens.len(), 2);
+        assert!(RepoCatalog::new(Some(" , ".into())).tokens.is_empty());
     }
 
     #[test]
