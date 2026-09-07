@@ -26,7 +26,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 pub use adapters::HarnessConfig;
-use adapters::{TurnCtx, tail_chars};
+use adapters::{ChildRegistry, TurnCtx, tail_chars};
 
 const CLAIM_WAIT_SECONDS: u32 = 30;
 const CLAIM_TIMEOUT_SECONDS: u64 = 45;
@@ -84,6 +84,8 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
     ));
 
     let workspace_manager = Arc::new(WorkspaceManager::new(opts.data_dir));
+    let children = Arc::new(ChildRegistry::default());
+    tokio::spawn(shutdown_on_signal(children.clone()));
     let mut backoff = Duration::from_secs(MIN_BACKOFF_SECONDS);
 
     loop {
@@ -115,8 +117,9 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
                 let workspace_manager = workspace_manager.clone();
                 let active_turns = active_turns.clone();
                 let harness = harness.clone();
+                let children = children.clone();
                 tokio::spawn(async move {
-                    process_work(api, &workspace_manager, &harness, work).await;
+                    process_work(api, &workspace_manager, &harness, &children, work).await;
                     active_turns.write().await.remove(&turn_id);
                     drop(permit);
                 });
@@ -135,14 +138,55 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
     }
 }
 
+/// A runner told to stop takes its harnesses with it. Without this, a
+/// redeploy or a launchd restart leaves the old harness running in the
+/// workspace while the new runner process reclaims the same turn and starts
+/// another, and two agents share one checkout.
+async fn shutdown_on_signal(children: Arc<ChildRegistry>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(term) => term,
+            Err(err) => {
+                warn!(error = %err, "cannot listen for SIGTERM; harnesses will outlive a restart");
+                return;
+            }
+        };
+        let mut int = match signal(SignalKind::interrupt()) {
+            Ok(int) => int,
+            Err(err) => {
+                warn!(error = %err, "cannot listen for SIGINT");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        let killed = children.terminate_all();
+        info!(killed, "shutting down; harness process groups terminated");
+        if killed > 0 {
+            time::sleep(Duration::from_secs(3)).await;
+            children.kill_all();
+        }
+        std::process::exit(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = children;
+    }
+}
+
 async fn process_work(
     api: RunnerApi,
     workspace_manager: &WorkspaceManager,
     harness: &HarnessConfig,
+    children: &ChildRegistry,
     work: ClaimedWork,
 ) {
     let turn_id = work.turn.id;
-    let report = execute_work(api.clone(), workspace_manager, harness, work)
+    let report = execute_work(api.clone(), workspace_manager, harness, children, work)
         .await
         .unwrap_or_else(|err| ReportRequest {
             status: TurnStatus::Error,
@@ -161,6 +205,7 @@ async fn execute_work(
     api: RunnerApi,
     workspace_manager: &WorkspaceManager,
     harness: &HarnessConfig,
+    children: &ChildRegistry,
     work: ClaimedWork,
 ) -> Result<ReportRequest> {
     let workspace = workspace_manager
@@ -190,6 +235,7 @@ async fn execute_work(
         chunk_sink: chunk_sink.clone(),
         cancel: cancel_rx,
         harness,
+        children,
     };
 
     let adapter_result = adapters::execute(lane.harness, ctx).await;
