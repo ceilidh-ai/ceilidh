@@ -43,6 +43,63 @@ pub struct HarnessConfig {
     pub token: Option<String>,
 }
 
+/// The harness process groups this runner currently has alive, so a shutdown
+/// can take them down instead of orphaning them into the next runner's turn.
+#[derive(Debug, Default)]
+pub(crate) struct ChildRegistry {
+    pids: std::sync::Mutex<std::collections::HashSet<u32>>,
+}
+
+impl ChildRegistry {
+    pub(crate) fn insert(&self, pid: u32) {
+        if let Ok(mut pids) = self.pids.lock() {
+            pids.insert(pid);
+        }
+    }
+
+    pub(crate) fn remove(&self, pid: u32) {
+        if let Ok(mut pids) = self.pids.lock() {
+            pids.remove(&pid);
+        }
+    }
+
+    fn live(&self) -> Vec<u32> {
+        self.pids
+            .lock()
+            .map(|pids| pids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// SIGTERM to every live harness process group; returns how many.
+    pub(crate) fn terminate_all(&self) -> usize {
+        let live = self.live();
+        for pid in &live {
+            signal_group(*pid, "TERM");
+        }
+        live.len()
+    }
+
+    /// SIGKILL to whatever is still alive.
+    pub(crate) fn kill_all(&self) {
+        for pid in self.live() {
+            signal_group(pid, "KILL");
+        }
+    }
+}
+
+/// Each harness is spawned into its own process group with pgid == pid, so
+/// a negative pid addresses the whole tree (the CLI, its shell commands, and
+/// the MCP grandchild).
+fn signal_group(pid: u32, signal: &str) {
+    let _ = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 pub(crate) struct TurnCtx<'a> {
     pub workspace_dir: &'a Path,
     /// Human title of the session, and the branch its workspace sits on.
@@ -62,6 +119,7 @@ pub(crate) struct TurnCtx<'a> {
     /// Flips to true when the human cancels the turn.
     pub cancel: watch::Receiver<bool>,
     pub harness: &'a HarnessConfig,
+    pub children: &'a ChildRegistry,
 }
 
 impl TurnCtx<'_> {
@@ -384,6 +442,13 @@ async fn run_streaming(
     });
 
     let child_pid = child.id();
+    if let Some(pid) = child_pid {
+        ctx.children.insert(pid);
+    }
+    let _unregister = Unregister {
+        registry: ctx.children,
+        pid: child_pid,
+    };
     let mut lines = BufReader::new(stdout).lines();
     let timeout = time::sleep(TURN_TIMEOUT);
     tokio::pin!(timeout);
@@ -499,6 +564,20 @@ async fn run_streaming(
         questions: Vec::new(),
     };
     Ok(AdapterOutcome::done(envelope, resume_token))
+}
+
+/// Drops the pid from the registry however the turn ends.
+struct Unregister<'a> {
+    registry: &'a ChildRegistry,
+    pid: Option<u32>,
+}
+
+impl Drop for Unregister<'_> {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            self.registry.remove(pid);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1081,23 @@ pub(crate) fn tail_chars(input: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn child_registry_tracks_and_forgets_pids() {
+        let registry = ChildRegistry::default();
+        registry.insert(4242);
+        registry.insert(4243);
+        assert_eq!(registry.live().len(), 2);
+        registry.remove(4242);
+        assert_eq!(registry.live(), vec![4243]);
+        {
+            let _guard = Unregister {
+                registry: &registry,
+                pid: Some(4243),
+            };
+        }
+        assert!(registry.live().is_empty());
+    }
+
     fn drive(parser: &mut dyn StreamParser, fixture: &str) -> Vec<String> {
         let mut chunks = Vec::new();
         for line in fixture.lines() {
@@ -1125,6 +1221,7 @@ mod tests {
             chunk_sink: ChunkSink { tx },
             cancel,
             harness: &harness,
+            children: &ChildRegistry::default(),
         };
         let toml = codex_config_toml(&ctx);
         assert!(toml.contains("model = \"gpt-5.6-sol\""));

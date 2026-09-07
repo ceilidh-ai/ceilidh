@@ -25,6 +25,7 @@ const DEFAULT_WAIT_MINUTES: u64 = 20;
 const MAX_WAIT_MINUTES: u64 = 20;
 const POLL_SECONDS: u64 = 2;
 const REPLY_CAP_CHARS: usize = 12_000;
+const GET_ATTEMPTS: u32 = 3;
 /// A parent that spawns more waiting children than the fleet has slots would
 /// deadlock until the waits time out.
 const MAX_CONCURRENT_SPAWNS: usize = 4;
@@ -313,13 +314,25 @@ impl Caller {
         request
     }
 
+    /// Reads are idempotent, so a caller redeploy or a proxy blip (a 502 with
+    /// an HTML body) is retried instead of landing in the model's context as
+    /// an error.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let response = self
-            .request(reqwest::Method::GET, path)
-            .send()
-            .await
-            .with_context(|| format!("GET {path}"))?;
-        decode(response, path).await
+        let mut last: Option<anyhow::Error> = None;
+        for attempt in 0..GET_ATTEMPTS {
+            if attempt > 0 {
+                time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+            let sent = self.request(reqwest::Method::GET, path).send().await;
+            match sent {
+                Ok(response) if response.status().is_server_error() => {
+                    last = Some(anyhow!("{path} -> HTTP {}", response.status()));
+                }
+                Ok(response) => return decode(response, path).await,
+                Err(err) => last = Some(anyhow::Error::from(err).context(format!("GET {path}"))),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("GET {path} failed")))
     }
 
     async fn post_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(
