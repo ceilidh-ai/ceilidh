@@ -1106,7 +1106,7 @@ function NewSessionForm({
               className="form-field"
               inputMode="url"
               onChange={(event) => setRepoUrl(event.target.value)}
-              placeholder="empty for a scratch workspace"
+              placeholder="https URL or absolute local path, empty for a scratch workspace"
               spellCheck={false}
               value={repoUrl}
             />

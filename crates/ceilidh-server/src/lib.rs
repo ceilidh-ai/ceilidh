@@ -194,6 +194,14 @@ struct AppState {
 /// The model menu the UI offers, grouped by vendor. Every row is a string
 /// the harness CLI accepts verbatim; the form also takes a free-text model
 /// so a new release never waits on a rebuild.
+///
+/// The Cursor rows are a curated subset of what `cursor-agent --list-models`
+/// reports (that command lists every id the signed-in account can reach,
+/// several hundred of them, mostly effort/context variants of the same
+/// underlying models). To refresh: run `cursor-agent --list-models`, confirm
+/// each id below still appears verbatim in the output, drop any that no
+/// longer exist, and add new ones by hand with a short label. There is no
+/// automatic sync between that command's output and this list.
 fn model_menu() -> Vec<ModelChoice> {
     fn row(vendor: &str, harness: Harness, model: &str, label: &str) -> ModelChoice {
         ModelChoice {
@@ -213,19 +221,44 @@ fn model_menu() -> Vec<ModelChoice> {
         a("claude-sonnet-5", "Claude Sonnet 5"),
         a("claude-sonnet-4-6", "Claude Sonnet 4.6"),
         a("claude-haiku-4-5", "Claude Haiku 4.5"),
+        o("gpt-6-astra", "GPT-6 Astra"),
         o("gpt-5.6-sol", "GPT-5.6 Sol"),
         o("gpt-5.6-terra", "GPT-5.6 Terra"),
         o("gpt-5.6-luna", "GPT-5.6 Luna"),
         o("gpt-5.5", "GPT-5.5"),
         c("cursor-grok-4.6-high", "Grok 4.6"),
         c("cursor-grok-4.6-xhigh", "Grok 4.6 Extra High"),
+        c("gemini-3.8-flash-high", "Gemini 3.8 Flash"),
         c("gemini-3.7-flash-high", "Gemini 3.7 Flash"),
+        c("gemini-3.1-pro", "Gemini 3.1 Pro"),
         c("gpt-5.6-sol-high", "GPT-5.6 Sol High (Cursor)"),
+        c("gpt-5.6-sol-xhigh", "GPT-5.6 Sol Extra High (Cursor)"),
         c("gpt-5.6-luna-high", "GPT-5.6 Luna High (Cursor)"),
         c("composer-2.5", "Composer 2.5"),
         c("claude-opus-5-thinking-high", "Claude Opus 5 Thinking (Cursor)"),
         c("claude-sonnet-5-thinking-high", "Claude Sonnet 5 Thinking (Cursor)"),
+        c("claude-fable-5-1-thinking-high", "Claude Fable 5.1 Thinking (Cursor)"),
     ]
+}
+
+#[cfg(test)]
+mod model_menu_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn model_menu_has_no_duplicate_harness_model_pairs_or_empty_models() {
+        let mut seen = HashSet::new();
+        for choice in model_menu() {
+            assert!(
+                !choice.model.trim().is_empty(),
+                "empty model string for label {:?}",
+                choice.label
+            );
+            let key = format!("{:?}:{}", choice.harness, choice.model);
+            assert!(seen.insert(key.clone()), "duplicate (harness, model) pair: {key}");
+        }
+    }
 }
 
 async fn get_config(State(state): State<AppState>) -> Json<CallerConfig> {
