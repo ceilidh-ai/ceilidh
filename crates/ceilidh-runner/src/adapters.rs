@@ -41,6 +41,48 @@ pub struct HarnessConfig {
     /// Caller URL and token handed to the MCP process.
     pub server_url: String,
     pub token: Option<String>,
+    /// Environment variables copied into every harness child even when they
+    /// are on the strip list below.
+    pub pass_env: Vec<String>,
+}
+
+/// Vendor API keys that would silently move a subscription lane (a Claude Max
+/// login, a ChatGPT login) onto metered billing. A key left in the operator's
+/// shell must not be what decides how a turn bills, so a harness child never
+/// inherits one unless the operator named it in --pass-env. CURSOR_API_KEY is
+/// deliberately absent: it is one of the Cursor CLI's two supported ways to
+/// authenticate, not an override of a login.
+pub(crate) const STRIPPED_ENV: [&str; 2] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+
+/// Which of the vendor keys this runner strips, given what it passes through.
+pub(crate) fn stripped_env(pass_env: &[String]) -> Vec<&'static str> {
+    STRIPPED_ENV
+        .into_iter()
+        .filter(|name| !pass_env.iter().any(|passed| passed.trim() == *name))
+        .collect()
+}
+
+/// What a harness child's environment does with the vendor keys.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EnvPlan {
+    /// Cleared from the child.
+    removed: Vec<&'static str>,
+    /// Copied through from the runner's own environment: name and value.
+    passed: Vec<(String, String)>,
+}
+
+/// `pass_env` wins over the strip list: a name there is copied into the child
+/// even when it is a vendor key.
+fn env_plan(pass_env: &[String], lookup: impl Fn(&str) -> Option<String>) -> EnvPlan {
+    EnvPlan {
+        removed: stripped_env(pass_env),
+        passed: pass_env
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| lookup(name).map(|value| (name.to_string(), value)))
+            .collect(),
+    }
 }
 
 /// The harness process groups this runner currently has alive, so a shutdown
@@ -349,19 +391,15 @@ async fn cursor(ctx: TurnCtx<'_>) -> Result<AdapterOutcome> {
 /// Puts a path back the way the repository has it, if the repository tracks it
 /// at all. Used after a harness config has been removed from a workspace.
 async fn restore_if_tracked(workspace_dir: &Path, path: &str) -> Result<()> {
-    let tracked = Command::new("git")
+    let tracked = crate::git_command(workspace_dir)
         .args(["ls-files", "--error-unmatch", "--", path])
-        .current_dir(workspace_dir)
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await?;
     if tracked.success() {
-        Command::new("git")
+        crate::git_command(workspace_dir)
             .args(["checkout", "--", path])
-            .current_dir(workspace_dir)
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -412,6 +450,15 @@ async fn run_streaming(
         .env("CEILIDH_SESSION_BRANCH", ctx.session_branch)
         .env("CEILIDH_TURN", ctx.seq.to_string())
         .kill_on_drop(true);
+
+    // Billing is part of the lane, not of whoever's shell started the runner.
+    let env = env_plan(&ctx.harness.pass_env, |name| std::env::var(name).ok());
+    for name in &env.removed {
+        command.env_remove(name);
+    }
+    for (name, value) in &env.passed {
+        command.env(name, value);
+    }
     #[cfg(unix)]
     {
         // The harness spawns the MCP server as a grandchild. Its own process
@@ -1081,6 +1128,36 @@ pub(crate) fn tail_chars(input: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// A key in the operator's shell must not be able to move a subscription
+    /// lane onto metered billing, and --pass-env must be able to override that.
+    #[test]
+    fn vendor_keys_are_stripped_unless_the_operator_passes_them() {
+        let shell = |name: &str| match name {
+            "ANTHROPIC_API_KEY" => Some("sk-ant-shell".to_string()),
+            "OPENAI_API_KEY" => Some("sk-oai-shell".to_string()),
+            "CURSOR_API_KEY" => Some("cursor-shell".to_string()),
+            _ => None,
+        };
+
+        let plan = env_plan(&[], shell);
+        assert_eq!(plan.removed, vec!["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+        assert!(plan.passed.is_empty());
+        // The Cursor CLI's key is one of its two auth paths, so it inherits.
+        assert!(!plan.removed.contains(&"CURSOR_API_KEY"));
+
+        let plan = env_plan(&["OPENAI_API_KEY".to_string()], shell);
+        assert_eq!(plan.removed, vec!["ANTHROPIC_API_KEY"]);
+        assert_eq!(
+            plan.passed,
+            vec![("OPENAI_API_KEY".to_string(), "sk-oai-shell".to_string())]
+        );
+
+        // A name the runner's own environment does not have is simply absent.
+        let plan = env_plan(&["CEILIDH_NOT_SET".to_string()], shell);
+        assert_eq!(plan.removed, vec!["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+        assert!(plan.passed.is_empty());
+    }
+
     #[test]
     fn child_registry_tracks_and_forgets_pids() {
         let registry = ChildRegistry::default();
@@ -1203,6 +1280,7 @@ mod tests {
             codex_auth: PathBuf::from("/Users/seat/.codex/auth.json"),
             server_url: "https://caller.example".into(),
             token: Some("tok\"en".into()),
+            pass_env: Vec::new(),
         };
         let ws = PathBuf::from("/Users/seat/ws");
         let sd = PathBuf::from("/Users/seat");

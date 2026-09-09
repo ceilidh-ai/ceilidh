@@ -107,6 +107,7 @@ function App() {
   useEffect(() => {
     let cancelled = false
     const decide = async () => {
+      consumeTokenFromUrl()
       const me = await fetch('/api/me', { credentials: 'same-origin' }).catch(
         () => null,
       )
@@ -2152,6 +2153,26 @@ function formatDateTime(value: string | null | undefined) {
 
 function readStoredToken() {
   return window.localStorage.getItem(tokenStorageKey) ?? ''
+}
+
+/** A local caller prints `open http://host/?token=...`, so the first load can
+ * sign itself in. The token is stored the way the token screen stores it, then
+ * dropped from the address bar, so it does not sit in history or survive a
+ * copied URL. */
+function consumeTokenFromUrl() {
+  const url = new URL(window.location.href)
+  const token = url.searchParams.get('token')
+  if (!token) {
+    return
+  }
+
+  window.localStorage.setItem(tokenStorageKey, token)
+  url.searchParams.delete('token')
+  window.history.replaceState(
+    null,
+    '',
+    `${url.pathname}${url.search}${url.hash}`,
+  )
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

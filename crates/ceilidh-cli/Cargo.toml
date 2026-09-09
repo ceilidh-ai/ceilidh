@@ -18,5 +18,7 @@ ceilidh-runner.workspace = true
 ceilidh-mcp.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+rand.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true

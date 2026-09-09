@@ -866,7 +866,14 @@ async fn post_turn(
         return Err(ApiError::unprocessable("input is required"));
     }
 
-    let mut tx = state.pool.begin().await?;
+    // BEGIN IMMEDIATE: this transaction reads the session and the queue, then
+    // writes. A deferred transaction takes its read snapshot first and asks for
+    // the write lock afterwards, and in WAL that upgrade fails outright with
+    // SQLITE_BUSY_SNAPSHOT (517) when another writer committed in between.
+    // busy_timeout does not cover it, because there is nothing to wait for: the
+    // snapshot is already stale. Taking the write lock up front makes the wait
+    // happen at BEGIN, where busy_timeout does apply.
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let session_row = sqlx::query(
         r#"
         SELECT id, title, lane_json, profile_json, runner_affinity, status, parent_id,
@@ -1133,7 +1140,10 @@ async fn try_claim(
         }
     }
 
-    let mut tx = state.pool.begin().await?;
+    // BEGIN IMMEDIATE for the same reason as post_turn: this reads the queue
+    // and then writes the claim, and a deferred snapshot cannot be upgraded
+    // once another writer has committed.
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     upsert_runner_seen(&mut tx, request).await?;
     let reclaimed = reclaim_stale_turns(&mut tx).await?;
 

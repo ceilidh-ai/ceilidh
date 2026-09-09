@@ -1407,3 +1407,119 @@ async fn a_login_cookie_is_as_good_as_the_token() -> Result<()> {
 
     Ok(())
 }
+
+/// A message posted while runners are claiming used to answer 500 with SQLite's
+/// "database is locked (code 517)". Both write paths read before they wrote, and
+/// in WAL a deferred transaction's read snapshot cannot be upgraded once another
+/// writer has committed; busy_timeout does not cover that, because there is
+/// nothing left to wait for. Both take the write lock at BEGIN now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_posts_and_claims_never_answer_500() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("ceilidh-contention-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)?;
+    let app = build_app(ServeOptions {
+        bind: "127.0.0.1:0".parse()?,
+        db_path: dir.join("ceilidh.db"),
+        token: Some("secret".to_string()),
+        default_repo_url: None,
+        github_token: None,
+        google: None,
+        cookie_secret: None,
+    })
+    .await?;
+
+    // Several sessions, because the queue cap is per session and a burst that
+    // is all rejections never reaches the write that used to fail.
+    let mut sessions = Vec::new();
+    for index in 0..4 {
+        let session: Session = send_json(
+            &app,
+            Method::POST,
+            "/api/sessions",
+            Some("secret"),
+            &CreateSessionRequest {
+                title: format!("contention {index}"),
+                lane: Some(Lane {
+                    harness: Harness::Mock,
+                    model: "mock".to_string(),
+                    effort: None,
+                }),
+                profile: None,
+                parent_id: None,
+            },
+        )
+        .await?;
+        sessions.push(session.id);
+    }
+
+    let mut accepted = 0usize;
+    for round in 0..4 {
+        let mut inflight = Vec::new();
+
+        // Eight messages at once.
+        for index in 0..8 {
+            let app = app.clone();
+            let session_id = sessions[index % sessions.len()];
+            inflight.push(tokio::spawn(async move {
+                let request = json_request(
+                    Method::POST,
+                    &format!("/api/sessions/{session_id}/turns"),
+                    Some("secret"),
+                    &PostTurnRequest {
+                        input: format!("round {round} message {index}"),
+                        lane: None,
+                    },
+                )?;
+                drive(app, request).await
+            }));
+        }
+
+        // Four runners claiming against the same file at the same time.
+        for index in 0..4 {
+            let app = app.clone();
+            inflight.push(tokio::spawn(async move {
+                let request = json_request(
+                    Method::POST,
+                    "/api/runner/claim",
+                    Some("secret"),
+                    &ClaimRequest {
+                        runner: format!("runner-{index}"),
+                        harnesses: vec![Harness::Mock],
+                        wait_seconds: 1,
+                        epoch: None,
+                    },
+                )?;
+                drive(app, request).await
+            }));
+        }
+
+        for task in inflight {
+            let (status, body) = task.await??;
+            assert!(
+                status.as_u16() < 500,
+                "a concurrent request answered {status}: {body}"
+            );
+            if status == StatusCode::ACCEPTED {
+                accepted += 1;
+            }
+        }
+    }
+
+    // Proof the burst actually wrote: a run where every post was rejected by
+    // the queue cap would satisfy the assertion above without contending.
+    assert!(
+        accepted >= 8,
+        "expected the bursts to queue turns, {accepted} were accepted"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
+/// Drives one request to completion, keeping the body for the failure message.
+async fn drive(app: Router, request: Request<Body>) -> Result<(StatusCode, String)> {
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, String::from_utf8_lossy(&bytes).to_string()))
+}
