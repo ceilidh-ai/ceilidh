@@ -761,13 +761,30 @@ async fn git_commit_allow_empty(workspace_dir: &Path, message: &str) -> Result<C
 }
 
 /// A session profile arrives over the API, so its repo URL is untrusted input
-/// that lands in a git argv. Only plain remote URLs are accepted.
+/// that lands in a git argv. Accepted forms: an http(s) URL, or a local git
+/// repository named by an absolute path (a plain `/...` path, or a
+/// `file://...` URL naming one). A relative path, a `~`-relative path, and an
+/// absolute path that is not a git repository are all rejected before the
+/// value ever reaches `git clone`.
 fn validate_repo_url(repo_url: &str) -> Result<()> {
     if repo_url.starts_with("https://") || repo_url.starts_with("http://") {
-        Ok(())
-    } else {
-        bail!("repo_url must be an http:// or https:// URL, got {repo_url:?}")
+        return Ok(());
     }
+
+    let path = Path::new(repo_url.strip_prefix("file://").unwrap_or(repo_url));
+    if path.is_absolute() && is_git_repository(path) {
+        return Ok(());
+    }
+
+    bail!(
+        "repo_url must be an absolute path to an existing git repository, or an http(s) URL, got {repo_url:?}"
+    )
+}
+
+/// True for an ordinary checkout (a `.git` directory at the root) or a bare
+/// repository (`HEAD` and `objects` present at the root).
+fn is_git_repository(path: &Path) -> bool {
+    path.join(".git").is_dir() || (path.join("HEAD").is_file() && path.join("objects").is_dir())
 }
 
 fn validate_ref_name(name: &str) -> Result<()> {
@@ -992,6 +1009,80 @@ mod tests {
         session.title = "   ".to_string();
         assert!(session_branch(&session).starts_with("ceilidh/session-"));
         assert_eq!(slugify("A".repeat(80).as_str()).len(), 40);
+    }
+
+    #[test]
+    fn validate_repo_url_accepts_http_and_https() {
+        assert!(validate_repo_url("https://example.com/repo.git").is_ok());
+        assert!(validate_repo_url("http://example.com/repo.git").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_url_accepts_an_absolute_path_to_a_checkout() {
+        if !git_available() {
+            return;
+        }
+        let dir = unique_temp_dir("validate-checkout");
+        init_git_repo(&dir, false);
+
+        assert!(validate_repo_url(dir.to_str().unwrap()).is_ok());
+        assert!(validate_repo_url(&format!("file://{}", dir.display())).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn validate_repo_url_accepts_an_absolute_path_to_a_bare_repository() {
+        if !git_available() {
+            return;
+        }
+        let dir = unique_temp_dir("validate-bare");
+        init_git_repo(&dir, true);
+
+        assert!(validate_repo_url(dir.to_str().unwrap()).is_ok());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn validate_repo_url_rejects_relative_and_home_relative_paths() {
+        assert!(validate_repo_url("relative/repo").is_err());
+        assert!(validate_repo_url("./relative/repo").is_err());
+        assert!(validate_repo_url("~/repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_url_rejects_an_absolute_path_that_is_not_a_git_repository() {
+        let dir = unique_temp_dir("validate-non-git");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = validate_repo_url(dir.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute path to an existing git repository"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn validate_repo_url_rejects_a_nonexistent_absolute_path() {
+        let dir = unique_temp_dir("validate-missing");
+        assert!(validate_repo_url(dir.to_str().unwrap()).is_err());
+    }
+
+    /// Runs `git init` (optionally `--bare`) in a freshly created directory.
+    fn init_git_repo(dir: &Path, bare: bool) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut args = vec!["init"];
+        if bare {
+            args.push("--bare");
+        }
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     fn test_session(profile: SessionProfile) -> Session {
