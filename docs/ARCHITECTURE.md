@@ -100,6 +100,30 @@ without it the token screen is what you get. The cookie key defaults to the
 bearer token, so rotating the token signs every browser out; set
 `CEILIDH_COOKIE_SECRET` to decouple them.
 
+## Where things live
+
+Everything ceilidh keeps on disk hangs off one root, `~/.ceilidh` (override
+with `CEILIDH_HOME`):
+
+- `~/.ceilidh/ceilidh.db`: the caller's SQLite state.
+- `~/.ceilidh/token` (mode 0600): the bearer token. `ceilidh up` and
+  `ceilidh serve` mint one and print it when none is given.
+- `~/.ceilidh/runner/`: the local runner's data dir.
+- `~/.ceilidh/runner/sessions/<session-id>/ws`: one git checkout per
+  session, never shared between sessions. It is cloned once, on branch
+  `ceilidh/<title-slug>-<first 8 of the id>` from the session's base
+  branch, committed after every turn, and pushed only when the session
+  profile allows push (children never push). The session directory also
+  holds that session's `codex-home` and its MCP config files.
+
+Configuration resolves `flag > env > default`: an explicit flag wins over an
+environment variable, which wins over the built-in default.
+
+A session's repository may be an http(s) URL or an absolute local path,
+cloned straight from disk (see "Choosing a repository" below). A true
+worktree mode, sharing objects with an existing checkout instead of cloning a
+fresh one, is planned but not built.
+
 ## Choosing a repository
 
 A session's repository is a per-session field with a configurable default
@@ -111,6 +135,14 @@ operator can reach, grouped by owner, most recently pushed first, cached for
 five minutes; the new-session form renders it as two dropdowns with a
 free-text escape hatch. With no token the endpoint reports itself unavailable
 and the form shows the free-text field alone, so the picker is additive.
+
+The free-text field, and `CEILIDH_DEFAULT_REPO`, also accept an absolute
+local path (or a `file://` URL naming one) to an existing git repository,
+bare or checked out; the runner clones it from disk exactly as it would
+clone a remote URL. A relative path, a `~`-relative path, or a path that does
+not name a git repository is rejected on the turn that tries to use it,
+with an error naming the rule (absolute path to an existing git repository,
+or an http(s) URL).
 
 ## Cancel
 
