@@ -34,7 +34,7 @@ key, no desktop app that has to stay open.
 Install the release binary:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/ceilidh-ai/ceilidh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ceilidh-ai/ceilidh/main/install.sh | bash
 ```
 
 This picks up a prebuilt binary for macOS (Apple Silicon or Intel) or Linux
@@ -115,6 +115,16 @@ Browsers can sign in with Google instead of pasting the token; see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the environment variables
 that turn it on.
 
+## Plays
+
+Ceilidh runs sessions and sub-agents. Multi-step deterministic plays (a graph
+of steps with gates, loops and approvals) are deliberately not built into
+Ceilidh and will not be: they run on a rented engine beside it, fabro today
+(https://fabro.sh), chosen so it can be swapped later. `install.sh
+--with-fabro` installs fabro through its own official installer, as an
+opt-in. fabro drives the same harness CLIs, so a play step and a session
+share the same logins.
+
 ## Configuration
 
 | Variable / flag | Purpose |
@@ -140,8 +150,9 @@ but not one a single laptop needs. See
 Pre-alpha, single operator. It assumes one person, or a small trusted group,
 not a multi-tenant service.
 
-Deliberately not built yet: multi-step factory-style plays, telemetry
-export, a secrets vault, multi-tenancy, Postgres. See
+Deliberately not built: multi-step plays (see Plays above). Not built yet:
+telemetry export, planned as a pluggable sink with Agent Beacon first and
+plain OTLP as an option; a secrets vault; multi-tenancy; Postgres. See
 [docs/BACKLOG.md](docs/BACKLOG.md) for the fuller list of known gaps, and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
 
