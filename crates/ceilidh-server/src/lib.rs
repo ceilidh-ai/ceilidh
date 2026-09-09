@@ -17,7 +17,7 @@ use axum::http::header;
 use axum::http::{StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive};
-use axum::response::{Html, IntoResponse, Response, Sse};
+use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 mod auth;
@@ -174,8 +174,44 @@ pub async fn build_app_with_web_dir(
         Some(dir) => app.fallback_service(
             ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html"))),
         ),
-        None => app.route("/", get(placeholder)),
+        None => app.fallback(embedded_web),
     })
+}
+
+/// The web client, baked in at compile time by `build.rs`. A build with no
+/// `web/dist` embeds a placeholder page instead, so the binary always answers.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "$OUT_DIR/web"]
+struct WebAssets;
+
+/// Serves the embedded client. Unknown paths get `index.html`, because the
+/// client routes them itself.
+async fn embedded_web(uri: Uri) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    let (path, file) = match WebAssets::get(requested) {
+        Some(file) => (requested, file),
+        None => match WebAssets::get("index.html") {
+            Some(file) => ("index.html", file),
+            None => return (StatusCode::NOT_FOUND, "no web client is embedded").into_response(),
+        },
+    };
+
+    // Vite fingerprints everything under assets/, so those are immutable; the
+    // index that names them must never be held.
+    let cache_control = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+
+    (
+        [
+            (header::CONTENT_TYPE, file.metadata.mimetype().to_string()),
+            (header::CACHE_CONTROL, cache_control.to_string()),
+        ],
+        file.data,
+    )
+        .into_response()
 }
 
 #[derive(Clone)]
@@ -498,10 +534,6 @@ fn html_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-async fn placeholder() -> Html<&'static str> {
-    Html("<!doctype html><title>ceilidh</title><main>ceilidh caller is running</main>")
 }
 
 async fn create_session(
