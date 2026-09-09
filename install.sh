@@ -1,8 +1,37 @@
 #!/usr/bin/env bash
+# Installs ceilidh from the latest GitHub release.
+#
+# Usage: install.sh [--with-fabro]
+#
+#   --with-fabro  also install fabro, the workflow engine ceilidh pairs with
+#                 for multi-step plays, from https://fabro.sh/install.sh.
+#                 Opt-in only; CEILIDH_WITH_FABRO=1 has the same effect.
+#
+# Honours INSTALL_DIR, CEILIDH_REPO and GITHUB_API_URL.
 set -euo pipefail
 
 REPO="${CEILIDH_REPO:-ceilidh-ai/ceilidh}"
 API_URL="${GITHUB_API_URL:-https://api.github.com}"
+FABRO_INSTALLER="https://fabro.sh/install.sh"
+
+with_fabro=0
+case "${CEILIDH_WITH_FABRO:-}" in
+  ""|0|false|no) ;;
+  *) with_fabro=1 ;;
+esac
+
+usage() {
+  echo "usage: install.sh [--with-fabro]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --with-fabro) with_fabro=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
 
 fail() {
   echo "error: $*" >&2
@@ -44,6 +73,18 @@ verify_checksum() {
     fail "checksum mismatch for $name: expected $expected, got $actual"
   fi
   echo "Verified $name against SHA256SUMS."
+}
+
+install_fabro() {
+  if command -v fabro >/dev/null 2>&1; then
+    echo "fabro is already installed at $(command -v fabro); leaving it alone."
+    return 0
+  fi
+
+  echo "Fetching the fabro installer from $FABRO_INSTALLER and running it with sh."
+  if ! curl -fsSL "$FABRO_INSTALLER" | sh; then
+    fail "the fabro installer failed (ceilidh itself is installed)"
+  fi
 }
 
 detect_target() {
@@ -155,3 +196,7 @@ fi
 
 install -m 0755 "$binary" "$dir/ceilidh"
 echo "ceilidh $tag_name installed to $dir/ceilidh"
+
+if [ "$with_fabro" -eq 1 ]; then
+  install_fabro
+fi
