@@ -38,9 +38,11 @@ fn main() {
         .join("dist");
     let staged = Path::new(&out_dir).join("web");
 
-    // When there is no dist yet this names a path that does not exist, so
-    // cargo reruns this script every build: the first build after
-    // `npm run build` then picks the client up with no `cargo clean`.
+    // With no dist yet this names a path that does not exist, so cargo reruns
+    // this script on every build and the first build after `npm run build`
+    // picks the client up. Cargo compares timestamps, so a dist restored with
+    // older ones (moving an earlier build back into place) wants a
+    // `touch web/dist` to be seen.
     println!("cargo:rerun-if-changed={}", dist.display());
 
     fs::create_dir_all(&staged).expect("create the staged web client");
