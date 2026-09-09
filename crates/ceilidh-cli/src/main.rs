@@ -118,7 +118,7 @@ struct ServeArgs {
     /// prints it (env: CEILIDH_TOKEN)
     #[arg(long, env = "CEILIDH_TOKEN")]
     token: Option<String>,
-    /// Directory of built web assets; defaults to web/dist when present
+    /// Serve the web client from this directory instead of the one embedded in the binary
     #[arg(long)]
     web_dir: Option<PathBuf>,
     /// Repository prefilled into the new-session form (env: CEILIDH_DEFAULT_REPO)
@@ -650,9 +650,9 @@ fn open_browser(url: &str) {
 }
 
 /// The explicit flag wins; otherwise web/dist is picked up when it exists.
+/// The client is embedded in the binary; a directory is served from disk only
+/// when the operator names one, so a stale `web/dist` beside the binary never
+/// shadows the embedded client.
 fn resolve_web_dir(flag: Option<PathBuf>) -> Option<PathBuf> {
-    flag.or_else(|| {
-        let default = PathBuf::from("web/dist");
-        default.is_dir().then_some(default)
-    })
+    flag
 }

@@ -136,7 +136,18 @@ share the same logins.
 | `CEILIDH_CLAUDE_BIN`, `CEILIDH_CODEX_BIN`, `CEILIDH_CURSOR_BIN` | Where a runner finds each harness CLI. Default to `claude`, `codex`, `cursor-agent` on `PATH`. |
 | `CEILIDH_CODEX_AUTH` | Codex login file a runner symlinks into each session's `CODEX_HOME`. Defaults to `~/.codex/auth.json`. |
 | `CEILIDH_MAX_TURNS` / `--max-turns` | Turns a runner plays at once. |
+| `CEILIDH_DB` / `--db` | The caller's SQLite file. Default `~/.ceilidh/ceilidh.db`. |
+| `CEILIDH_DATA_DIR` / `--data-dir` | Where a runner keeps session checkouts. Default `~/.ceilidh/runner`. |
+| `CEILIDH_PASS_ENV` / `--pass-env NAME` | Variables to pass into a harness child even though they are stripped by default (see below). Repeatable, or comma separated in the variable. |
+| `--no-open` | Do not open the browser when `ceilidh up` starts. |
 | Google sign-in | `CEILIDH_GOOGLE_CLIENT_ID`, `CEILIDH_GOOGLE_CLIENT_SECRET`, `CEILIDH_PUBLIC_URL`, `CEILIDH_ALLOWED_EMAILS`, `CEILIDH_COOKIE_SECRET`; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
+
+A harness child never inherits `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` from
+your shell, so a subscription login is never silently switched to metered
+billing by a key that happened to be exported. To run a harness on an API key
+on purpose, start with `--pass-env ANTHROPIC_API_KEY` (or set
+`CEILIDH_PASS_ENV`). `CURSOR_API_KEY` passes through, since it is the Cursor
+CLI's own auth path.
 
 ## Fleet seats (advanced)
 
