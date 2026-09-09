@@ -784,7 +784,9 @@ fn validate_repo_url(repo_url: &str) -> Result<()> {
 /// True for an ordinary checkout (a `.git` directory at the root) or a bare
 /// repository (`HEAD` and `objects` present at the root).
 fn is_git_repository(path: &Path) -> bool {
-    path.join(".git").is_dir() || (path.join("HEAD").is_file() && path.join("objects").is_dir())
+    // `.git` is a directory in a normal checkout and a file (a gitdir pointer)
+    // inside a git worktree; both are clonable sources.
+    path.join(".git").exists() || (path.join("HEAD").is_file() && path.join("objects").is_dir())
 }
 
 fn validate_ref_name(name: &str) -> Result<()> {
