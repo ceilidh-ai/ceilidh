@@ -19,6 +19,33 @@ build_from_source() {
   echo "  cargo install --path crates/ceilidh-cli"
 }
 
+# Verifies the tarball against the release SHA256SUMS. A release without that
+# asset, or a system with no sha256 tool, installs exactly as it did before.
+verify_checksum() {
+  archive_path="$1"
+  name="$2"
+  sums_url="$3"
+
+  [ -n "$sums_url" ] || return 0
+
+  if command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$archive_path" | awk '{ print $1 }')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$archive_path" | awk '{ print $1 }')"
+  else
+    return 0
+  fi
+
+  sums="$(curl -fsSL "$sums_url" 2>/dev/null || true)"
+  expected="$(printf '%s\n' "$sums" | awk -v name="$name" '$2 == name || $2 == "*" name { print $1; exit }')"
+  [ -n "$expected" ] || return 0
+
+  if [ "$expected" != "$actual" ]; then
+    fail "checksum mismatch for $name: expected $expected, got $actual"
+  fi
+  echo "Verified $name against SHA256SUMS."
+}
+
 detect_target() {
   os="$(uname -s)"
   arch="$(uname -m)"
@@ -94,6 +121,7 @@ tag_name="$(printf '%s\n' "$release_json" | extract_field tag_name)"
 version="${tag_name#v}"
 asset_name="ceilidh-${version}-${target}.tar.gz"
 asset_url="$(printf '%s\n' "$release_json" | find_asset_url "$asset_name")"
+sums_url="$(printf '%s\n' "$release_json" | find_asset_url "SHA256SUMS")"
 
 if [[ -z "$tag_name" || -z "$asset_url" ]]; then
   build_from_source
@@ -111,6 +139,7 @@ extract_dir="$tmp_dir/extract"
 mkdir -p "$extract_dir"
 
 curl -fsSL "$asset_url" -o "$archive"
+verify_checksum "$archive" "$asset_name" "$sums_url"
 tar -xzf "$archive" -C "$extract_dir"
 
 binary="$(find "$extract_dir" -type f -name ceilidh -print -quit)"
