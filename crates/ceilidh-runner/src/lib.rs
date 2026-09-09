@@ -67,6 +67,8 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
     let active_turns = Arc::new(RwLock::new(HashSet::new()));
     let max_turns = opts.max_turns.max(1);
     let slots = Arc::new(Semaphore::new(max_turns));
+    let stripped = adapters::stripped_env(&opts.harness.pass_env);
+    let passed = opts.harness.pass_env.clone();
     let harness = Arc::new(opts.harness);
 
     info!(
@@ -76,6 +78,13 @@ pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
         harnesses = ?opts.harnesses,
         max_turns,
         "ceilidh runner starting"
+    );
+    // Which vendor keys a harness child can see decides whether a subscription
+    // lane bills, so it is said out loud at startup rather than assumed.
+    info!(
+        stripped = %name_list(&stripped),
+        passed = %name_list(&passed),
+        "harness child environment"
     );
 
     tokio::spawn(heartbeat_loop(
@@ -852,17 +861,29 @@ async fn resume_remote_branch(workspace_dir: &Path, branch: &str) -> Result<bool
     Ok(true)
 }
 
-async fn run_git(workspace_dir: &Path, args: Vec<String>) -> Result<CommandOutput> {
-    debug!(cwd = %workspace_dir.display(), args = ?args, "running git command");
-    let output = Command::new("git")
+/// Every git this runner spawns is built here, so no call site can miss the
+/// hardening.
+pub(crate) fn git_command(workspace_dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(workspace_dir)
         // A session repo is untrusted content: never let its hooks execute as
         // the runner's OS user, which holds the harness and git credentials.
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        // A runner slot is scarce and nobody is watching this terminal: a
+        // missing credential must fail the turn, not hold the slot open on a
+        // prompt no one can answer.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null());
+    command
+}
+
+async fn run_git(workspace_dir: &Path, args: Vec<String>) -> Result<CommandOutput> {
+    debug!(cwd = %workspace_dir.display(), args = ?args, "running git command");
+    let output = git_command(workspace_dir)
         .args(&args)
-        .current_dir(workspace_dir)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -949,6 +970,18 @@ fn command_stdout_trimmed(program: &str) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// A comma-separated list for a log line, or "none" when it is empty.
+fn name_list<S: AsRef<str>>(names: &[S]) -> String {
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn next_backoff(current: Duration) -> Duration {
