@@ -34,7 +34,7 @@ key, no desktop app that has to stay open.
 Install the release binary:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/ceilidh-ai/ceilidh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ceilidh-ai/ceilidh/main/install.sh | bash
 ```
 
 This picks up a prebuilt binary for macOS (Apple Silicon or Intel) or Linux
@@ -115,6 +115,16 @@ Browsers can sign in with Google instead of pasting the token; see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the environment variables
 that turn it on.
 
+## Plays
+
+Ceilidh runs sessions and sub-agents. Multi-step deterministic plays (a graph
+of steps with gates, loops and approvals) are deliberately not built into
+Ceilidh and will not be: they run on a rented engine beside it, fabro today
+(https://fabro.sh), chosen so it can be swapped later. `install.sh
+--with-fabro` installs fabro through its own official installer, as an
+opt-in. fabro drives the same harness CLIs, so a play step and a session
+share the same logins.
+
 ## Configuration
 
 | Variable / flag | Purpose |
@@ -126,7 +136,18 @@ that turn it on.
 | `CEILIDH_CLAUDE_BIN`, `CEILIDH_CODEX_BIN`, `CEILIDH_CURSOR_BIN` | Where a runner finds each harness CLI. Default to `claude`, `codex`, `cursor-agent` on `PATH`. |
 | `CEILIDH_CODEX_AUTH` | Codex login file a runner symlinks into each session's `CODEX_HOME`. Defaults to `~/.codex/auth.json`. |
 | `CEILIDH_MAX_TURNS` / `--max-turns` | Turns a runner plays at once. |
+| `CEILIDH_DB` / `--db` | The caller's SQLite file. Default `~/.ceilidh/ceilidh.db`. |
+| `CEILIDH_DATA_DIR` / `--data-dir` | Where a runner keeps session checkouts. Default `~/.ceilidh/runner`. |
+| `CEILIDH_PASS_ENV` / `--pass-env NAME` | Variables to pass into a harness child even though they are stripped by default (see below). Repeatable, or comma separated in the variable. |
+| `--no-open` | Do not open the browser when `ceilidh up` starts. |
 | Google sign-in | `CEILIDH_GOOGLE_CLIENT_ID`, `CEILIDH_GOOGLE_CLIENT_SECRET`, `CEILIDH_PUBLIC_URL`, `CEILIDH_ALLOWED_EMAILS`, `CEILIDH_COOKIE_SECRET`; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
+
+A harness child never inherits `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` from
+your shell, so a subscription login is never silently switched to metered
+billing by a key that happened to be exported. To run a harness on an API key
+on purpose, start with `--pass-env ANTHROPIC_API_KEY` (or set
+`CEILIDH_PASS_ENV`). `CURSOR_API_KEY` passes through, since it is the Cursor
+CLI's own auth path.
 
 ## Fleet seats (advanced)
 
@@ -140,8 +161,9 @@ but not one a single laptop needs. See
 Pre-alpha, single operator. It assumes one person, or a small trusted group,
 not a multi-tenant service.
 
-Deliberately not built yet: multi-step factory-style plays, telemetry
-export, a secrets vault, multi-tenancy, Postgres. See
+Deliberately not built: multi-step plays (see Plays above). Not built yet:
+telemetry export, planned as a pluggable sink with Agent Beacon first and
+plain OTLP as an option; a secrets vault; multi-tenancy; Postgres. See
 [docs/BACKLOG.md](docs/BACKLOG.md) for the fuller list of known gaps, and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
 
