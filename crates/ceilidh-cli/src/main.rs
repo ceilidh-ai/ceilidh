@@ -236,11 +236,13 @@ async fn main() -> Result<()> {
             // The guard sees only what the operator supplied: a token minted
             // into the home directory is not a decision to publish this box.
             guard_exposed_bind(a.bind, a.token.as_ref())?;
-            let home = ceilidh_home()?;
-            ensure_home(&home)?;
+            let mut home = LocalHome::default();
             let google = a.google();
-            let token = resolve_token(a.token, &home)?;
-            let db_path = a.db.unwrap_or_else(|| home.join("ceilidh.db"));
+            let token = resolve_token(a.token, &mut home)?;
+            let db_path = match a.db {
+                Some(db) => db,
+                None => home.path()?.join("ceilidh.db"),
+            };
             let cookie_secret = a.cookie_secret;
             let web_dir = resolve_web_dir(a.web_dir);
             announce(a.bind, &token);
@@ -261,11 +263,7 @@ async fn main() -> Result<()> {
         Cmd::Runner(a) => {
             let data_dir = match a.data_dir {
                 Some(dir) => dir,
-                None => {
-                    let home = ceilidh_home()?;
-                    ensure_home(&home)?;
-                    home.join("runner")
-                }
+                None => LocalHome::default().path()?.join("runner"),
             };
             std::fs::create_dir_all(&data_dir)
                 .with_context(|| format!("create {}", data_dir.display()))?;
@@ -294,12 +292,17 @@ async fn main() -> Result<()> {
             // The guard sees only what the operator supplied: a token minted
             // into the home directory is not a decision to publish this box.
             guard_exposed_bind(bind, a.serve.token.as_ref())?;
-            let home = ceilidh_home()?;
-            ensure_home(&home)?;
+            let mut home = LocalHome::default();
             let google = a.serve.google();
-            let token = resolve_token(a.serve.token, &home)?;
-            let db_path = a.serve.db.unwrap_or_else(|| home.join("ceilidh.db"));
-            let data_dir = a.data_dir.unwrap_or_else(|| home.join("runner"));
+            let token = resolve_token(a.serve.token, &mut home)?;
+            let db_path = match a.serve.db {
+                Some(db) => db,
+                None => home.path()?.join("ceilidh.db"),
+            };
+            let data_dir = match a.data_dir {
+                Some(dir) => dir,
+                None => home.path()?.join("runner"),
+            };
             std::fs::create_dir_all(&data_dir)
                 .with_context(|| format!("create {}", data_dir.display()))?;
             let web_dir = resolve_web_dir(a.serve.web_dir);
@@ -413,6 +416,24 @@ fn ceilidh_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".ceilidh"))
 }
 
+/// The home, resolved and created the first time something actually defaults
+/// into it. A caller that is given its database and its token (the container
+/// image is) never touches a home directory, and so never needs a HOME.
+#[derive(Default)]
+struct LocalHome(Option<PathBuf>);
+
+impl LocalHome {
+    fn path(&mut self) -> Result<PathBuf> {
+        if let Some(home) = &self.0 {
+            return Ok(home.clone());
+        }
+        let home = ceilidh_home()?;
+        ensure_home(&home)?;
+        self.0 = Some(home.clone());
+        Ok(home)
+    }
+}
+
 /// The home holds a bearer token and every session's working copy, so it
 /// belongs to this user alone.
 fn ensure_home(home: &Path) -> Result<()> {
@@ -441,7 +462,7 @@ struct ResolvedToken {
 /// A local caller should not make the operator invent a credential. The flag
 /// or env wins; otherwise the one saved in the home directory is reused, and
 /// otherwise a fresh one is minted and saved.
-fn resolve_token(supplied: Option<String>, home: &Path) -> Result<ResolvedToken> {
+fn resolve_token(supplied: Option<String>, home: &mut LocalHome) -> Result<ResolvedToken> {
     if let Some(value) = supplied.filter(|token| !token.trim().is_empty()) {
         return Ok(ResolvedToken {
             value,
@@ -449,7 +470,7 @@ fn resolve_token(supplied: Option<String>, home: &Path) -> Result<ResolvedToken>
         });
     }
 
-    let path = home.join("token");
+    let path = home.path()?.join("token");
     let saved = std::fs::read_to_string(&path)
         .map(|saved| saved.trim().to_string())
         .unwrap_or_default();
