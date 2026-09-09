@@ -7,6 +7,13 @@ unlocks the login keychain) exists because the harness CLIs read their
 subscription credentials from the login keychain, and only an sshd-made login
 session can read it without a GUI login.
 
+**This is a fleet pattern, not a default.** Everything below assumes several
+macOS user accounts sharing one host, each with its own login keychain
+holding that seat's harness subscriptions. A single laptop, running under
+your own login as yourself, never needs any of this: just run `ceilidh up`
+or `ceilidh runner` directly and it will use whatever harness logins your
+own session already has.
+
 Files per seat, all under `/Users/<user>/ceilidh/`:
 
 | Path | Purpose |

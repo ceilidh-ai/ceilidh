@@ -1,73 +1,163 @@
 # ceilidh
 
-Deterministic orchestration for your staff of agents.
+Run a staff of coding agents across Claude Code, Codex and Cursor: on your
+own machines, on your own subscriptions.
 
-**Status: pre-alpha walking skeleton.** Private while it takes shape.
+The server here is called the **caller**, the harness CLIs it drives are the
+**band**, and agents take **turns**; the rest of this document just says
+session, runner and lane.
 
-A ceilidh (KAY-lee) is a gathering where everyone brings a turn: nobody performs
-for the room, nobody watches from the wall. The **caller** resolves which agent
-takes the next turn; the **band** (model harnesses such as Claude Code and
-Codex) plays it, and the dances do not change when the band does. Agents take
-**turns**. Everything else here is deliberately plain: sessions, runs,
-workspaces, gates.
+## The problem
 
-## What this is
+You want several agent sessions running at once, spread across Claude Code,
+Codex and Cursor, each in its own git checkout, able to spawn sub-agents on
+other vendors when a task calls for it, reachable from a browser or a phone,
+running on your own machines against your own subscriptions: no metered API
+key, no desktop app that has to stay open.
 
-The interactive sessions workbench: run ad-hoc agent sessions on your own
-machines (a Mac Mini fleet, a spare box, a cloud VM), each session in its own
-git worktree, every turn committed and pushed, reachable from any browser or
-phone with your laptop shut. Subscription-seat native: runners execute through
-the harness CLIs you are already logged into; no metered API keys required.
+## What you get
 
-One binary:
+- One binary that runs a caller (HTTP API, SSE, embedded web UI, SQLite) and
+  one or more runners (the processes that shell out to a harness CLI).
+- Multi-vendor out of the box: Claude Code, OpenAI Codex CLI, Cursor agent,
+  plus a deterministic mock harness for trying it with no logins at all.
+- One git checkout per session, on its own branch, committed on every turn.
+- Sessions can spawn sub-agents, on any vendor, through an MCP server
+  attached to every harness process.
+- A web UI reachable from any browser or phone, with a live event feed per
+  session.
+- Subscription-native: runners execute through the harness CLIs you are
+  already logged into. No metered API key required.
 
-- `ceilidh serve` runs the caller: HTTP API, embedded web UI, session state (SQLite).
-- `ceilidh runner` runs a band runner on any machine that holds your harness logins.
-- `ceilidh up` runs both in one process for a single box.
+## Quickstart
 
-## Layout
+Install the release binary:
 
 ```
-crates/ceilidh-protocol   the shared contract (serde types only, no IO)
-crates/ceilidh-caller     session and turn state machine
-crates/ceilidh-server     axum API + SSE events + embedded web UI + SQLite store
-crates/ceilidh-runner     claim loop, per-session git workspaces, band adapters
-crates/ceilidh-cli        the ceilidh binary
-web/                      React web app (built into the binary)
+curl -fsSL https://raw.githubusercontent.com/ceilidh-ai/ceilidh/main/install.sh | sh
 ```
 
-Design notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+This picks up a prebuilt binary for macOS (Apple Silicon or Intel) or Linux
+x86_64. From a clone, `cargo install --path crates/ceilidh-cli` also works;
+build the web UI first (`cd web && npm ci && npm run build`) so it gets
+embedded in the binary.
 
-## Deploy
+Then:
 
-The caller runs anywhere that can serve HTTP; the runners run wherever your
-harness logins live.
+```
+ceilidh up
+```
 
-- **Caller:** the `Dockerfile` builds the binary with the web client baked in,
-  serves on `$PORT`, and keeps SQLite on a mounted volume
-  (`CEILIDH_DB`, default `/data/ceilidh.db`). Set `CEILIDH_TOKEN` and
-  optionally `CEILIDH_DEFAULT_REPO`.
-- **Runners on macOS:** `deploy/launchd/install-runner.sh <user> <binary>
-  <runner.env>` installs one LaunchDaemon per seat user, unlocking that user's
-  login keychain so the harness CLIs can read their subscription credentials.
-  `uninstall-runner.sh <user>` is the exact undo. Details in
-  [deploy/launchd/README.md](deploy/launchd/README.md).
-- **Check it:** `scripts/vendor-smoke.sh` creates one session per vendor
-  through the API and asserts a non-empty first reply.
+This starts the caller and a local runner on `http://127.0.0.1:8080`, offers
+every harness CLI it finds on your `PATH` (`claude`, `codex`, `cursor-agent`),
+mints a bearer token on first run, and prints a URL with the token in it.
+Open that URL; it also opens your browser for you (`--no-open` to skip that).
 
-## Dev
+No harness CLI installed, or just want to look around first? `ceilidh up
+--mock` runs with a deterministic echo harness, so you can try the whole flow
+with no logins at all.
+
+**Prerequisites:** `git`, and at least one of Claude Code (`claude`), Codex
+CLI (`codex`) or Cursor agent (`cursor-agent`), installed and logged in.
+Cursor can also read `CURSOR_API_KEY` from the environment.
+
+## Sessions, lanes and sub-agents
+
+A session runs on a lane: a harness, a model, and an optional effort level.
+Models are whatever string the harness CLI itself uses (`claude-opus-5`,
+`gpt-6-astra`, `cursor-grok-4.6-high`). Routing is explicit: a lane naming a
+harness or model this installation does not offer is a 422 with the menu of
+what is actually available, never a silent fallback.
+
+Every harness process gets a stdio MCP server (`ceilidh mcp`) exposing
+`spawn_subagent`, `list_sessions` and `read_session`, so any session can hand
+off work to a sub-agent on any vendor: a Claude Code session can spawn a
+Codex child, which can spawn a Cursor grandchild. Children are ordinary
+sessions, with their own lane, workspace and branch, visible under their
+parent in the UI and continuable on their own.
+
+## Where things live
+
+Everything lives under `~/.ceilidh` (override with `CEILIDH_HOME`):
+
+```
+~/.ceilidh/
+  ceilidh.db                        caller state (SQLite)
+  token                             the bearer token, mode 0600
+  runner/sessions/<session-id>/ws   one git checkout per session
+```
+
+A session's checkout lives on its own branch, `ceilidh/<title-slug>-<id8>`,
+committed on every turn and pushed only when the session allows push;
+sub-agent children never push. A repository is an https URL or an absolute
+local path; true worktree mode, sharing objects with an existing checkout
+instead of cloning fresh, is planned but not built yet.
+
+## Caller here, runners anywhere
+
+The caller and its runners do not have to share a machine. Run the caller
+wherever it is reachable:
+
+```
+ceilidh serve --token <t>
+```
+
+and a runner on any machine that holds your harness logins:
+
+```
+ceilidh runner --server https://<host> --token <t> --harness claude-code --harness codex
+```
+
+Runners only ever dial out to the caller; nothing needs to be opened on a
+runner's machine. A caller bound to anything beyond loopback refuses to
+start without an explicit token, so it never comes up silently exposed.
+Browsers can sign in with Google instead of pasting the token; see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the environment variables
+that turn it on.
+
+## Configuration
+
+| Variable / flag | Purpose |
+|---|---|
+| `CEILIDH_HOME` | Root directory for the database, token and runner workspaces. Default `~/.ceilidh`. |
+| `CEILIDH_TOKEN` / `--token` | Bearer token guarding the API and the runner protocol. |
+| `CEILIDH_DEFAULT_REPO` | Prefilled into the new-session form. |
+| `CEILIDH_GITHUB_TOKEN` | One or more read-only GitHub tokens (comma-separated) that turn the repository field into a picker. |
+| `CEILIDH_CLAUDE_BIN`, `CEILIDH_CODEX_BIN`, `CEILIDH_CURSOR_BIN` | Where a runner finds each harness CLI. Default to `claude`, `codex`, `cursor-agent` on `PATH`. |
+| `CEILIDH_CODEX_AUTH` | Codex login file a runner symlinks into each session's `CODEX_HOME`. Defaults to `~/.codex/auth.json`. |
+| `CEILIDH_MAX_TURNS` / `--max-turns` | Turns a runner plays at once. |
+| Google sign-in | `CEILIDH_GOOGLE_CLIENT_ID`, `CEILIDH_GOOGLE_CLIENT_SECRET`, `CEILIDH_PUBLIC_URL`, `CEILIDH_ALLOWED_EMAILS`, `CEILIDH_COOKIE_SECRET`; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). |
+
+## Fleet seats (advanced)
+
+Running several runners on one Mac, one per macOS user account so each holds
+its own harness logins in its own login keychain, is a real deployment shape
+but not one a single laptop needs. See
+[deploy/launchd/README.md](deploy/launchd/README.md).
+
+## Status
+
+Pre-alpha, single operator. It assumes one person, or a small trusted group,
+not a multi-tenant service.
+
+Deliberately not built yet: multi-step factory-style plays, telemetry
+export, a secrets vault, multi-tenancy, Postgres. See
+[docs/BACKLOG.md](docs/BACKLOG.md) for the fuller list of known gaps, and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
+
+## Development
 
 ```
 cargo build --workspace
 cargo test --workspace
-(cd web && npm install && npm run build)
+(cd web && npm ci && npm run build)
 bash scripts/smoke.sh
 ```
 
-## Configuration
+`scripts/smoke.sh` runs a caller, a runner and a mock-harness session
+end to end with nothing external required. `scripts/vendor-smoke.sh` does
+the same against a real deployment, one session per real vendor.
 
-The caller reads `CEILIDH_TOKEN` (the machine credential runners and the
-sub-agent MCP present), `CEILIDH_DEFAULT_REPO` (prefilled into the
-new-session form), `CEILIDH_GITHUB_TOKEN` (one or more read-only GitHub
-tokens, comma-separated, that turn the repository field into a picker), and
-the Google sign-in set described in `docs/ARCHITECTURE.md`.
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -70,3 +70,27 @@ multi-tenancy, Postgres.
   install story true.
 - No release has been cut, so `install.sh` falls back to building from
   source.
+
+## From the 2026-09-08 laptop review
+
+1. **Per-session `CLAUDE_CONFIG_DIR` isolation.** Claude Code currently reads
+   the operator's whole `~/.claude` (memory, settings, credentials) for every
+   session; a session-scoped config directory would stop sessions from
+   sharing that state.
+2. **An allowlisted child environment with per-lane credentials.** The
+   harness inherits the runner's whole environment today, so an API key
+   sitting in the shell silently flips a subscription lane to metered
+   billing.
+3. **A sub-agent depth cap, and a fast failure when no runner has a free
+   slot, instead of leaving parents waiting.** `--max-turns 1` deadlocks a
+   spawn: the parent holds its one slot waiting on a child that has nowhere
+   to run.
+4. **Runner credentials separate from the operator token.** Same root cause
+   as the phase-1 items above: one token still authorizes both the browser
+   and the runner protocol.
+5. **A telemetry sink**, so a session's turns are observable somewhere
+   other than the caller's own SQLite and the web UI.
+6. **True worktree mode**, sharing objects with an existing checkout instead
+   of cloning fresh per session.
+7. **A Linux arm64 release target.** Today's release matrix covers macOS
+   (Apple Silicon and Intel) and Linux x86_64 only.
