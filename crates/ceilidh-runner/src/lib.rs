@@ -1035,6 +1035,19 @@ mod tests {
         fs::remove_dir_all(data_dir).await.unwrap();
     }
 
+    /// A missing credential must fail the turn, not hold a runner slot open on
+    /// a prompt nobody can see.
+    #[test]
+    fn git_never_asks_the_terminal_for_a_credential() {
+        let command = git_command(Path::new("/tmp"));
+        let prompt = command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == "GIT_TERMINAL_PROMPT")
+            .and_then(|(_, value)| value);
+        assert_eq!(prompt, Some("0".as_ref()));
+    }
+
     #[test]
     fn branch_names_are_slugged_and_unique() {
         let mut session = test_session(SessionProfile::default());

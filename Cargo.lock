@@ -257,7 +257,9 @@ dependencies = [
  "ceilidh-runner",
  "ceilidh-server",
  "clap",
+ "rand 0.9.5",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]
