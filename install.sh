@@ -1,8 +1,37 @@
 #!/usr/bin/env bash
+# Installs ceilidh from the latest GitHub release.
+#
+# Usage: install.sh [--with-fabro]
+#
+#   --with-fabro  also install fabro, the workflow engine ceilidh pairs with
+#                 for multi-step plays, from https://fabro.sh/install.sh.
+#                 Opt-in only; CEILIDH_WITH_FABRO=1 has the same effect.
+#
+# Honours INSTALL_DIR, CEILIDH_REPO and GITHUB_API_URL.
 set -euo pipefail
 
 REPO="${CEILIDH_REPO:-ceilidh-ai/ceilidh}"
 API_URL="${GITHUB_API_URL:-https://api.github.com}"
+FABRO_INSTALLER="https://fabro.sh/install.sh"
+
+with_fabro=0
+case "${CEILIDH_WITH_FABRO:-}" in
+  ""|0|false|no) ;;
+  *) with_fabro=1 ;;
+esac
+
+usage() {
+  echo "usage: install.sh [--with-fabro]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --with-fabro) with_fabro=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
 
 fail() {
   echo "error: $*" >&2
@@ -17,6 +46,45 @@ build_from_source() {
   echo "No release asset is available for this system yet."
   echo "Build from source with:"
   echo "  cargo install --path crates/ceilidh-cli"
+}
+
+# Verifies the tarball against the release SHA256SUMS. A release without that
+# asset, or a system with no sha256 tool, installs exactly as it did before.
+verify_checksum() {
+  archive_path="$1"
+  name="$2"
+  sums_url="$3"
+
+  [ -n "$sums_url" ] || return 0
+
+  if command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$archive_path" | awk '{ print $1 }')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$archive_path" | awk '{ print $1 }')"
+  else
+    return 0
+  fi
+
+  sums="$(curl -fsSL "$sums_url" 2>/dev/null || true)"
+  expected="$(printf '%s\n' "$sums" | awk -v name="$name" '$2 == name || $2 == "*" name { print $1; exit }')"
+  [ -n "$expected" ] || return 0
+
+  if [ "$expected" != "$actual" ]; then
+    fail "checksum mismatch for $name: expected $expected, got $actual"
+  fi
+  echo "Verified $name against SHA256SUMS."
+}
+
+install_fabro() {
+  if command -v fabro >/dev/null 2>&1; then
+    echo "fabro is already installed at $(command -v fabro); leaving it alone."
+    return 0
+  fi
+
+  echo "Fetching the fabro installer from $FABRO_INSTALLER and running it with sh."
+  if ! curl -fsSL "$FABRO_INSTALLER" | sh; then
+    fail "the fabro installer failed (ceilidh itself is installed)"
+  fi
 }
 
 detect_target() {
@@ -94,6 +162,7 @@ tag_name="$(printf '%s\n' "$release_json" | extract_field tag_name)"
 version="${tag_name#v}"
 asset_name="ceilidh-${version}-${target}.tar.gz"
 asset_url="$(printf '%s\n' "$release_json" | find_asset_url "$asset_name")"
+sums_url="$(printf '%s\n' "$release_json" | find_asset_url "SHA256SUMS")"
 
 if [[ -z "$tag_name" || -z "$asset_url" ]]; then
   build_from_source
@@ -111,6 +180,7 @@ extract_dir="$tmp_dir/extract"
 mkdir -p "$extract_dir"
 
 curl -fsSL "$asset_url" -o "$archive"
+verify_checksum "$archive" "$asset_name" "$sums_url"
 tar -xzf "$archive" -C "$extract_dir"
 
 binary="$(find "$extract_dir" -type f -name ceilidh -print -quit)"
@@ -126,3 +196,7 @@ fi
 
 install -m 0755 "$binary" "$dir/ceilidh"
 echo "ceilidh $tag_name installed to $dir/ceilidh"
+
+if [ "$with_fabro" -eq 1 ]; then
+  install_fabro
+fi

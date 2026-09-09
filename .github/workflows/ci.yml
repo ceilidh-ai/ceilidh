@@ -21,12 +21,6 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build workspace
-        run: cargo build --workspace
-
-      - name: Test workspace
-        run: cargo test --workspace
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -37,6 +31,12 @@ jobs:
       - name: Build web
         run: npm ci && npm run build
         working-directory: web
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
 
       - name: Smoke
         run: bash scripts/smoke.sh

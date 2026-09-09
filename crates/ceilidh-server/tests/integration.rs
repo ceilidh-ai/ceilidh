@@ -208,14 +208,13 @@ async fn runner_flow_emits_sse_and_persists_final_state() -> Result<()> {
 }
 
 #[tokio::test]
-async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
-    let placeholder_dir =
-        std::env::temp_dir().join(format!("ceilidh-placeholder-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&placeholder_dir)?;
+async fn web_serving_uses_embedded_client_then_disk_when_given() -> Result<()> {
+    let embedded_dir = std::env::temp_dir().join(format!("ceilidh-embedded-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&embedded_dir)?;
 
-    let placeholder_app = build_app(ServeOptions {
+    let embedded_app = build_app(ServeOptions {
         bind: "127.0.0.1:0".parse()?,
-        db_path: placeholder_dir.join("ceilidh.db"),
+        db_path: embedded_dir.join("ceilidh.db"),
         token: None,
         default_repo_url: None,
         github_token: None,
@@ -224,15 +223,35 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
     })
     .await?;
 
-    let placeholder = decode_text(
-        placeholder_app
-            .oneshot(request(Method::GET, "/", None, Body::empty())?)
-            .await
-            .unwrap(),
-    )
-    .await?;
-    assert!(placeholder.contains("ceilidh caller is running"));
-    std::fs::remove_dir_all(placeholder_dir)?;
+    // The embedded client is whatever build.rs staged: the real Vite output
+    // when web/dist was built, the placeholder page otherwise.
+    let root = embedded_app
+        .clone()
+        .oneshot(request(Method::GET, "/", None, Body::empty())?)
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::OK);
+    assert!(
+        header_value(&root, header::CONTENT_TYPE).starts_with("text/html"),
+        "index should be served as HTML"
+    );
+    assert_eq!(header_value(&root, header::CACHE_CONTROL), "no-cache");
+    let root = decode_text(root).await?;
+    assert!(root.contains("<html"), "index should be an HTML document");
+
+    // The client routes its own paths, so an unknown one gets the index.
+    let spa = embedded_app
+        .oneshot(request(
+            Method::GET,
+            "/sessions/local-route",
+            None,
+            Body::empty(),
+        )?)
+        .await
+        .unwrap();
+    assert_eq!(spa.status(), StatusCode::OK);
+    assert_eq!(decode_text(spa).await?, root);
+    std::fs::remove_dir_all(embedded_dir)?;
 
     let web_dir = std::env::temp_dir().join(format!("ceilidh-web-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&web_dir)?;
@@ -245,13 +264,14 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
             token: None,
             default_repo_url: None,
             github_token: None,
-        google: None,
-        cookie_secret: None,
+            google: None,
+            cookie_secret: None,
         },
         Some(web_dir.clone()),
     )
     .await?;
 
+    // A web dir on disk wins over the embedded copy.
     let root = decode_text(
         app.clone()
             .oneshot(request(Method::GET, "/", None, Body::empty())?)
@@ -276,6 +296,15 @@ async fn web_serving_uses_placeholder_or_index_fallback() -> Result<()> {
 
     std::fs::remove_dir_all(web_dir)?;
     Ok(())
+}
+
+fn header_value(response: &Response<Body>, name: header::HeaderName) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 async fn send_json<T, U>(
